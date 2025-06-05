@@ -1,0 +1,14 @@
+# farmlink.service
+[Unit]
+Description=FarmLink Gunicorn Service
+After=network.target
+
+[Service]
+User=farmlinkuser
+Group=www-data
+WorkingDirectory=/app
+EnvironmentFile=/etc/secrets/farmlink.env
+ExecStart=/usr/local/bin/gunicorn farmlink.wsgi:application --workers 3
+
+[Install]
+WantedBy=multi-user.target
