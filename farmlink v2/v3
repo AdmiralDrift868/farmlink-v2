@@ -1,0 +1,909 @@
+# farmlink_tt_enhanced.py
+import re
+import json
+import logging
+import stripe 
+import requests
+from decimal import Decimal
+from datetime import timedelta
+from django.db import models, transaction
+from django.contrib.auth.models import AbstractUser
+from django.contrib.auth.hashers import make_password
+from django.contrib.auth import authenticate, login
+from django.http import JsonResponse, HttpResponse
+from django.views.decorators.http import require_http_methods
+from django.views.decorators.csrf import csrf_exempt
+from django.contrib.auth.decorators import login_required
+from django.core.paginator import Paginator, EmptyPage
+from django.db.models import Q, F, CheckConstraint, Sum, Avg, Count
+from django.utils import timezone
+from django.core.validators import MinValueValidator, EmailValidator
+from django.core.cache import cache
+from django.urls import path
+from django.conf import settings
+from django.core.files.storage import FileSystemStorage
+from django.core.mail import send_mail
+from django.template.loader import render_to_string
+from geopy.distance import geodesic
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from django.contrib.postgres.search import SearchVector
+import uuid
+import hashlib
+
+# Enhanced logging configuration
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+# ======================
+# ENHANCED MODEL DEFINITIONS
+# ======================
+
+class CARICOMCountry(models.Model):
+    code = models.CharField(max_length=2, primary_key=True, editable=False)
+    name = models.CharField(max_length=50, unique=True)
+    currency_code = models.CharField(max_length=3, default='TTD')
+    tax_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0.0)
+    phone_code = models.CharField(max_length=5, default='+1')
+    
+    class Meta:
+        verbose_name_plural = "CARICOM Countries"
+        ordering = ['name']
+
+class ProductCategory(models.Model):
+    code = models.CharField(max_length=10, unique=True)
+    name = models.CharField(max_length=50)
+    export_restricted = models.BooleanField(default=False)
+    icon = models.CharField(max_length=50, blank=True)  # Font Awesome icon
+    
+    class Meta:
+        verbose_name_plural = "Product Categories"
+
+class Farmer(AbstractUser):
+    # Custom fields
+    farm_name = models.CharField(max_length=100, unique=True)
+    country = models.ForeignKey(CARICOMCountry, on_delete=models.PROTECT)
+    region = models.CharField(max_length=50)
+    certification = models.CharField(max_length=100, blank=True)
+    verification_status = models.CharField(
+        max_length=20,
+        choices=[
+            ('pending', 'Pending'),
+            ('verified', 'Verified'),
+            ('rejected', 'Rejected')
+        ],
+        default='pending'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_updated = models.DateTimeField(auto_now=True)
+    location = models.CharField(max_length=100, blank=True)  # 'latitude,longitude'
+    payment_method = models.CharField(max_length=50, blank=True)
+    phone_number = models.CharField(max_length=20, blank=True)
+    bio = models.TextField(blank=True)
+    rating = models.DecimalField(max_digits=3, decimal_places=2, null=True, default=0.0)
+    total_reviews = models.PositiveIntegerField(default=0)
+    
+    # Required for custom user model
+    USERNAME_FIELD = 'farm_name'
+    REQUIRED_FIELDS = ['email', 'country']
+    
+    class Meta:
+        indexes = [
+            models.Index(fields=['verification_status']),
+            models.Index(fields=['country', 'region']),
+            models.Index(fields=['rating']),
+        ]
+
+class Product(models.Model):
+    UNIT_CHOICES = [
+        ('kg', 'Kilogram'),
+        ('lb', 'Pound'),
+        ('crt', 'Crate'),
+        ('bnd', 'Bundle'),
+        ('dz', 'Dozen'),
+        ('ea', 'Each'),
+        ('bag', 'Bag'),
+    ]
+    
+    name = models.CharField(max_length=100)
+    description = models.TextField(blank=True)
+    price = models.DecimalField(
+        max_digits=8, 
+        decimal_places=2,
+        validators=[MinValueValidator(0.01)]
+    )
+    unit = models.CharField(max_length=5, choices=UNIT_CHOICES)
+    quantity = models.PositiveIntegerField()
+    category = models.ForeignKey(ProductCategory, on_delete=models.PROTECT)
+    farmer = models.ForeignKey(Farmer, on_delete=models.CASCADE, related_name='products')
+    harvest_date = models.DateField()
+    is_organic = models.BooleanField(default=False)
+    is_featured = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    image = models.ImageField(
+        upload_to='products/',
+        null=True,
+        blank=True,
+        storage=FileSystemStorage(location='protected_media/')
+    )
+    views = models.PositiveIntegerField(default=0)
+    likes = models.PositiveIntegerField(default=0)
+    
+    class Meta:
+        indexes = [
+            models.Index(fields=['category', 'harvest_date']),
+            models.Index(fields=['price', 'quantity']),
+            models.Index(fields=['name', 'description']),
+            models.Index(fields=['created_at']),
+            models.Index(fields=['is_featured']),
+        ]
+        constraints = [
+            CheckConstraint(
+                check=Q(quantity__gte=0),
+                name='non_negative_quantity'
+            )
+        ]
+
+class Wishlist(models.Model):
+    user = models.ForeignKey(Farmer, on_delete=models.CASCADE, related_name='wishlists')
+    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    added_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        unique_together = ('user', 'product')
+
+class Cart(models.Model):
+    user = models.ForeignKey(Farmer, on_delete=models.CASCADE, related_name='carts')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True)
+    session_key = models.CharField(max_length=40, blank=True)  # For anonymous users
+    
+    def total(self):
+        return self.items.aggregate(
+            total=Sum(F('quantity') * F('product__price'))
+        )['total'] or Decimal('0.00')
+    
+    def item_count(self):
+        return self.items.aggregate(count=Sum('quantity'))['count'] or 0
+
+class CartItem(models.Model):
+    cart = models.ForeignKey(Cart, on_delete=models.CASCADE, related_name='items')
+    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    quantity = models.PositiveIntegerField(default=1)
+    added_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        unique_together = ('cart', 'product')
+
+class Order(models.Model):
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('paid', 'Paid'),
+        ('processing', 'Processing'),
+        ('shipped', 'Shipped'),
+        ('delivered', 'Delivered'),
+        ('cancelled', 'Cancelled'),
+        ('refunded', 'Refunded'),
+    ]
+    
+    buyer = models.ForeignKey(Farmer, on_delete=models.PROTECT, related_name='orders')
+    farmer = models.ForeignKey(Farmer, on_delete=models.PROTECT, related_name='farmer_orders')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    total_amount = models.DecimalField(max_digits=10, decimal_places=2)
+    tax_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0.0)
+    shipping_cost = models.DecimalField(max_digits=10, decimal_places=2, default=0.0)
+    payment_intent_id = models.CharField(max_length=100, blank=True)
+    tracking_number = models.CharField(max_length=100, blank=True)
+    shipping_address = models.TextField()
+    notes = models.TextField(blank=True)
+    estimated_delivery = models.DateField(null=True, blank=True)
+
+class OrderItem(models.Model):
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='items')
+    product = models.ForeignKey(Product, on_delete=models.PROTECT)
+    quantity = models.PositiveIntegerField()
+    price = models.DecimalField(max_digits=8, decimal_places=2)
+
+class Review(models.Model):
+    RATING_CHOICES = [(i, str(i)) for i in range(1, 6)]
+    
+    order = models.OneToOneField(Order, on_delete=models.CASCADE, related_name='review')
+    rating = models.PositiveSmallIntegerField(choices=RATING_CHOICES)
+    comment = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_verified_purchase = models.BooleanField(default=True)
+
+class Notification(models.Model):
+    TYPE_CHOICES = [
+        ('order', 'Order Update'),
+        ('payment', 'Payment'),
+        ('system', 'System'),
+        ('message', 'Message'),
+        ('promotion', 'Promotion'),
+    ]
+    
+    user = models.ForeignKey(Farmer, on_delete=models.CASCADE, related_name='notifications')
+    message = models.TextField()
+    notification_type = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    related_object_id = models.PositiveIntegerField(null=True, blank=True)
+    url = models.URLField(blank=True)
+
+# ======================
+# ENHANCED UTILITIES & SERVICES
+# ======================
+
+class DataValidator:
+    @staticmethod
+    def validate_password(password):
+        if len(password) < 8:
+            return False, "Password must be at least 8 characters"
+        if not re.search(r"[A-Z]", password):
+            return False, "Password must contain an uppercase letter"
+        if not re.search(r"[a-z]", password):
+            return False, "Password must contain a lowercase letter"
+        if not re.search(r"[0-9]", password):
+            return False, "Password must contain a digit"
+        if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", password):
+            return False, "Password must contain a special character"
+        return True, ""
+
+    @staticmethod
+    def validate_email(email):
+        validator = EmailValidator()
+        try:
+            validator(email)
+            return True, ""
+        except:
+            return False, "Invalid email format"
+
+    @staticmethod
+    def sanitize_input(text):
+        if not text:
+            return text
+        # Remove potentially dangerous characters
+        sanitized = re.sub(r'[<>"\']', '', str(text))
+        # Limit length
+        return sanitized.strip()[:500]
+    
+    @staticmethod
+    def validate_phone(phone):
+        pattern = r'^\+?[\d\s\-\(\)]{10,20}$'
+        return bool(re.match(pattern, phone))
+    
+    @staticmethod
+    def validate_location(location):
+        try:
+            if not location:
+                return False, "Location is required"
+            parts = location.split(',')
+            if len(parts) != 2:
+                return False, "Invalid location format"
+            lat, lon = float(parts[0]), float(parts[1])
+            if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+                return False, "Invalid coordinates"
+            return True, ""
+        except:
+            return False, "Invalid location format"
+
+class GeoService:
+    @staticmethod
+    def calculate_shipping_cost(origin, destination, weight_kg=1.0):
+        try:
+            origin_coords = tuple(map(float, origin.split(',')))
+            dest_coords = tuple(map(float, destination.split(',')))
+            
+            distance = geodesic(origin_coords, dest_coords).kilometers
+            
+            # Base cost + per km rate + weight factor
+            base_cost = Decimal('50.00')
+            per_km = Decimal('1.20')
+            weight_factor = Decimal(str(weight_kg * 0.5))
+            
+            cost = base_cost + (per_km * Decimal(str(distance))) + weight_factor
+            return max(cost, Decimal('50.00'))  # Minimum shipping cost
+        except Exception as e:
+            logger.error(f"Shipping cost calculation error: {str(e)}")
+            return Decimal('100.00')
+
+class PaymentService:
+    def __init__(self):
+        stripe.api_key = getattr(settings, 'STRIPE_SECRET_KEY', '')
+    
+    def create_payment_intent(self, amount, currency, metadata=None):
+        try:
+            return stripe.PaymentIntent.create(
+                amount=int(amount * 100),  # Convert to cents
+                currency=currency.lower(),
+                metadata=metadata or {},
+                automatic_payment_methods={"enabled": True},
+            )
+        except stripe.error.StripeError as e:
+            logger.error(f"Stripe error: {str(e)}")
+            return None
+    
+    def confirm_payment(self, payment_intent_id):
+        try:
+            return stripe.PaymentIntent.confirm(payment_intent_id)
+        except stripe.error.StripeError as e:
+            logger.error(f"Payment confirmation error: {str(e)}")
+            return None
+
+class NotificationService:
+    @staticmethod
+    def send_notification(user, message, notif_type, related_id=None, url=""):
+        notification = Notification.objects.create(
+            user=user,
+            message=message,
+            notification_type=notif_type,
+            related_object_id=related_id,
+            url=url
+        )
+        
+        # Send email for critical notifications
+        if notif_type in ['order', 'payment']:
+            subject = f"FarmLink: {notif_type.capitalize()} Update"
+            html_message = render_to_string('emails/notification.html', {
+                'user': user,
+                'message': message,
+                'notification_type': notif_type
+            })
+            send_mail(
+                subject,
+                message,
+                settings.DEFAULT_FROM_EMAIL,
+                [user.email],
+                html_message=html_message,
+                fail_silently=True,
+            )
+        
+        return notification
+
+class SearchService:
+    @staticmethod
+    def advanced_search(query, category=None, min_price=None, max_price=None, 
+                       is_organic=None, sort_by='relevance'):
+        # Use PostgreSQL full-text search if available
+        if getattr(settings, 'USE_POSTGRES', False):
+            search_vector = SearchVector('name', 'description', 'farmer__farm_name')
+            queryset = Product.objects.annotate(search=search_vector).filter(search=query)
+        else:
+            # Fallback to basic search
+            queryset = Product.objects.filter(
+                Q(name__icontains=query) |
+                Q(description__icontains=query) |
+                Q(farmer__farm_name__icontains=query)
+            )
+        
+        # Apply filters
+        if category:
+            queryset = queryset.filter(category__code=category)
+        if min_price:
+            queryset = queryset.filter(price__gte=min_price)
+        if max_price:
+            queryset = queryset.filter(price__lte=max_price)
+        if is_organic is not None:
+            queryset = queryset.filter(is_organic=is_organic)
+        
+        # Apply sorting
+        sort_options = {
+            'price_asc': 'price',
+            'price_desc': '-price',
+            'date': '-created_at',
+            'popularity': '-views',
+            'rating': '-farmer__rating'
+        }
+        if sort_by in sort_options:
+            queryset = queryset.order_by(sort_options[sort_by])
+        else:
+            queryset = queryset.order_by('-created_at')
+        
+        return queryset
+
+class AnalyticsService:
+    @staticmethod
+    def get_farmer_dashboard_data(farmer):
+        # Sales summary
+        thirty_days_ago = timezone.now() - timedelta(days=30)
+        orders = Order.objects.filter(
+            farmer=farmer,
+            created_at__gte=thirty_days_ago
+        )
+        
+        total_sales = orders.aggregate(
+            total=Sum('total_amount')
+        )['total'] or Decimal('0.00')
+        
+        order_count = orders.count()
+        
+        # Recent orders
+        recent_orders = orders.order_by('-created_at')[:10].values(
+            'id', 'created_at', 'total_amount', 'status', 'buyer__farm_name'
+        )
+        
+        # Top products
+        top_products = OrderItem.objects.filter(
+            order__farmer=farmer,
+            order__created_at__gte=thirty_days_ago
+        ).values('product__name').annotate(
+            total_quantity=Sum('quantity'),
+            total_revenue=Sum(F('quantity') * F('price'))
+        ).order_by('-total_revenue')[:5]
+        
+        # Monthly trend
+        monthly_data = orders.extra(
+            select={'month': "EXTRACT(month FROM created_at)"}
+        ).values('month').annotate(
+            total=Sum('total_amount'),
+            count=Count('id')
+        ).order_by('month')
+        
+        return {
+            'total_sales': total_sales,
+            'order_count': order_count,
+            'recent_orders': list(recent_orders),
+            'top_products': list(top_products),
+            'monthly_trend': list(monthly_data)
+        }
+
+# ======================
+# ENHANCED API VIEWS
+# ======================
+
+class EnhancedCartAPI(APIView):
+    @login_required
+    def get(self, request):
+        cart, _ = Cart.objects.get_or_create(user=request.user, is_active=True)
+        items = cart.items.select_related('product', 'product__farmer').all()
+        
+        cart_data = {
+            'id': cart.id,
+            'total': str(cart.total()),
+            'item_count': cart.item_count(),
+            'items': [{
+                'id': item.id,
+                'product_id': item.product.id,
+                'name': item.product.name,
+                'price': str(item.product.price),
+                'quantity': item.quantity,
+                'subtotal': str(item.product.price * item.quantity),
+                'farmer_name': item.product.farmer.farm_name,
+                'image_url': item.product.image.url if item.product.image else None
+            } for item in items]
+        }
+        return JsonResponse(cart_data)
+    
+    @login_required
+    def post(self, request):
+        try:
+            data = json.loads(request.body)
+            product_id = data.get('product_id')
+            quantity = int(data.get('quantity', 1))
+            
+            if quantity <= 0:
+                return JsonResponse({'error': 'Invalid quantity'}, status=400)
+            
+            product = Product.objects.get(id=product_id)
+            
+            if product.quantity < quantity:
+                return JsonResponse({'error': 'Insufficient stock'}, status=400)
+            
+            cart, _ = Cart.objects.get_or_create(user=request.user, is_active=True)
+            
+            # Update or create cart item
+            cart_item, created = CartItem.objects.get_or_create(
+                cart=cart,
+                product=product,
+                defaults={'quantity': quantity}
+            )
+            
+            if not created:
+                new_quantity = cart_item.quantity + quantity
+                if product.quantity < new_quantity:
+                    return JsonResponse({'error': 'Insufficient stock'}, status=400)
+                cart_item.quantity = new_quantity
+                cart_item.save()
+            
+            # Update product views
+            product.views = F('views') + 1
+            product.save()
+            
+            return JsonResponse({
+                'status': 'success',
+                'message': f'Added {quantity} {product.name} to cart'
+            }, status=201)
+            
+        except Product.DoesNotExist:
+            return JsonResponse({'error': 'Product not found'}, status=404)
+        except json.JSONDecodeError:
+            return JsonResponse({'error': 'Invalid JSON data'}, status=400)
+        except Exception as e:
+            logger.error(f"Cart error: {str(e)}")
+            return JsonResponse({'error': 'Failed to add item to cart'}, status=500)
+    
+    @login_required
+    def delete(self, request, item_id):
+        try:
+            cart = Cart.objects.get(user=request.user, is_active=True)
+            cart_item = CartItem.objects.get(cart=cart, id=item_id)
+            cart_item.delete()
+            return JsonResponse({'status': 'success'})
+        except (Cart.DoesNotExist, CartItem.DoesNotExist):
+            return JsonResponse({'error': 'Item not found'}, status=404)
+
+class EnhancedOrderAPI(APIView):
+    @login_required
+    def post(self, request):
+        try:
+            data = json.loads(request.body)
+            shipping_address = DataValidator.sanitize_input(data.get('shipping_address'))
+            notes = DataValidator.sanitize_input(data.get('notes', ''))
+            
+            if not shipping_address:
+                return JsonResponse({'error': 'Shipping address required'}, status=400)
+            
+            cart = Cart.objects.get(user=request.user, is_active=True)
+            items = cart.items.select_related('product').all()
+            
+            if not items:
+                return JsonResponse({'error': 'Cart is empty'}, status=400)
+            
+            with transaction.atomic():
+                # Calculate totals
+                subtotal = sum(item.product.price * item.quantity for item in items)
+                tax_rate = request.user.country.tax_rate / 100
+                tax_amount = subtotal * Decimal(str(tax_rate))
+                
+                # Calculate shipping cost
+                shipping_cost = Decimal('100.00')
+                if request.user.location and items:
+                    farmer_location = items[0].product.farmer.location
+                    if farmer_location:
+                        total_weight = sum(item.quantity for item in items)  # Simplified weight
+                        shipping_cost = GeoService.calculate_shipping_cost(
+                            farmer_location, 
+                            request.user.location,
+                            total_weight
+                        )
+                
+                total_amount = subtotal + tax_amount + shipping_cost
+                
+                # Create order
+                order = Order.objects.create(
+                    buyer=request.user,
+                    farmer=items[0].product.farmer,
+                    total_amount=total_amount,
+                    tax_amount=tax_amount,
+                    shipping_cost=shipping_cost,
+                    shipping_address=shipping_address,
+                    notes=notes,
+                    estimated_delivery=timezone.now().date() + timedelta(days=3)
+                )
+                
+                # Create order items and update inventory
+                for item in items:
+                    OrderItem.objects.create(
+                        order=order,
+                        product=item.product,
+                        quantity=item.quantity,
+                        price=item.product.price
+                    )
+                    
+                    # Update product quantity
+                    item.product.quantity = F('quantity') - item.quantity
+                    item.product.save()
+                
+                # Create payment intent
+                payment_service = PaymentService()
+                payment_intent = payment_service.create_payment_intent(
+                    amount=total_amount,
+                    currency=request.user.country.currency_code,
+                    metadata={'order_id': order.id}
+                )
+                
+                if not payment_intent:
+                    raise Exception("Payment processing failed")
+                
+                order.payment_intent_id = payment_intent.id
+                order.save()
+                
+                # Deactivate cart
+                cart.is_active = False
+                cart.save()
+                
+                # Send notifications
+                NotificationService.send_notification(
+                    request.user,
+                    f"Order #{order.id} created. Total: ${total_amount}",
+                    'order',
+                    order.id,
+                    f'/orders/{order.id}'
+                )
+                
+                NotificationService.send_notification(
+                    order.farmer,
+                    f"New order #{order.id} from {request.user.farm_name}",
+                    'order',
+                    order.id,
+                    f'/farmer/orders/{order.id}'
+                )
+                
+                return JsonResponse({
+                    'status': 'success',
+                    'order_id': order.id,
+                    'client_secret': payment_intent.client_secret,
+                    'total_amount': str(total_amount)
+                }, status=201)
+        
+        except Cart.DoesNotExist:
+            return JsonResponse({'error': 'Active cart not found'}, status=404)
+        except Exception as e:
+            logger.error(f"Order creation error: {str(e)}")
+            return JsonResponse({'error': 'Order processing failed'}, status=500)
+    
+    @login_required
+    def get(self, request):
+        try:
+            page = int(request.GET.get('page', 1))
+            page_size = min(int(request.GET.get('page_size', 10)), 50)
+            
+            orders = Order.objects.filter(buyer=request.user).order_by('-created_at')
+            paginator = Paginator(orders, page_size)
+            
+            try:
+                page_obj = paginator.page(page)
+            except EmptyPage:
+                return JsonResponse({'orders': [], 'total_pages': paginator.num_pages})
+            
+            orders_data = [{
+                'id': order.id,
+                'created_at': order.created_at.isoformat(),
+                'status': order.status,
+                'total_amount': str(order.total_amount),
+                'farmer_name': order.farmer.farm_name,
+                'item_count': order.items.count()
+            } for order in page_obj]
+            
+            return JsonResponse({
+                'orders': orders_data,
+                'current_page': page,
+                'total_pages': paginator.num_pages,
+                'total_orders': paginator.count
+            })
+        except Exception as e:
+            logger.error(f"Order list error: {str(e)}")
+            return JsonResponse({'error': 'Failed to retrieve orders'}, status=500)
+
+class EnhancedReviewAPI(APIView):
+    @login_required
+    def post(self, request, order_id):
+        try:
+            data = json.loads(request.body)
+            rating = int(data.get('rating'))
+            comment = DataValidator.sanitize_input(data.get('comment', ''))
+            
+            if not (1 <= rating <= 5):
+                return JsonResponse({'error': 'Rating must be between 1 and 5'}, status=400)
+            
+            order = Order.objects.get(
+                id=order_id, 
+                buyer=request.user, 
+                status='delivered'
+            )
+            
+            # Create or update review
+            review, created = Review.objects.update_or_create(
+                order=order,
+                defaults={
+                    'rating': rating,
+                    'comment': comment
+                }
+            )
+            
+            # Update farmer rating
+            farmer = order.farmer
+            farmer_reviews = Review.objects.filter(
+                order__farmer=farmer
+            ).aggregate(
+                avg_rating=Avg('rating'),
+                total_reviews=Count('id')
+            )
+            
+            farmer.rating = farmer_reviews['avg_rating'] or 0.0
+            farmer.total_reviews = farmer_reviews['total_reviews']
+            farmer.save()
+            
+            return JsonResponse({
+                'status': 'success',
+                'message': 'Review submitted successfully'
+            }, status=201)
+            
+        except Order.DoesNotExist:
+            return JsonResponse({'error': 'Order not found or not eligible for review'}, status=404)
+        except (ValueError, TypeError):
+            return JsonResponse({'error': 'Invalid rating value'}, status=400)
+        except Exception as e:
+            logger.error(f"Review error: {str(e)}")
+            return JsonResponse({'error': 'Failed to submit review'}, status=500)
+
+class WishlistAPI(APIView):
+    @login_required
+    def post(self, request):
+        try:
+            data = json.loads(request.body)
+            product_id = data.get('product_id')
+            
+            product = Product.objects.get(id=product_id)
+            
+            Wishlist.objects.get_or_create(
+                user=request.user,
+                product=product
+            )
+            
+            return JsonResponse({'status': 'success'}, status=201)
+        except Product.DoesNotExist:
+            return JsonResponse({'error': 'Product not found'}, status=404)
+        except Exception as e:
+            logger.error(f"Wishlist error: {str(e)}")
+            return JsonResponse({'error': 'Failed to add to wishlist'}, status=500)
+    
+    @login_required
+    def get(self, request):
+        wishlist_items = Wishlist.objects.filter(
+            user=request.user
+        ).select_related('product', 'product__farmer')
+        
+        items_data = [{
+            'id': item.id,
+            'product_id': item.product.id,
+            'name': item.product.name,
+            'price': str(item.product.price),
+            'farmer_name': item.product.farmer.farm_name,
+            'image_url': item.product.image.url if item.product.image else None,
+            'added_at': item.added_at.isoformat()
+        } for item in wishlist_items]
+        
+        return JsonResponse({'items': items_data})
+    
+    @login_required
+    def delete(self, request, product_id):
+        try:
+            Wishlist.objects.filter(
+                user=request.user,
+                product_id=product_id
+            ).delete()
+            return JsonResponse({'status': 'success'})
+        except Exception as e:
+            logger.error(f"Wishlist delete error: {str(e)}")
+            return JsonResponse({'error': 'Failed to remove from wishlist'}, status=500)
+
+class AnalyticsAPI(APIView):
+    @login_required
+    def get(self, request):
+        try:
+            dashboard_data = AnalyticsService.get_farmer_dashboard_data(request.user)
+            return JsonResponse(dashboard_data)
+        except Exception as e:
+            logger.error(f"Analytics error: {str(e)}")
+            return JsonResponse({'error': 'Failed to retrieve analytics'}, status=500)
+
+class SearchAPI(APIView):
+    def get(self, request):
+        try:
+            query = request.GET.get('q', '')
+            category = request.GET.get('category')
+            min_price = request.GET.get('min_price')
+            max_price = request.GET.get('max_price')
+            is_organic = request.GET.get('organic')
+            sort_by = request.GET.get('sort', 'relevance')
+            page = int(request.GET.get('page', 1))
+            page_size = min(int(request.GET.get('page_size', 12)), 50)
+            
+            if not query:
+                return JsonResponse({'products': [], 'total_pages': 0})
+            
+            # Perform search
+            queryset = SearchService.advanced_search(
+                query, category, min_price, max_price, 
+                is_organic == 'true' if is_organic else None, sort_by
+            )
+            
+            # Paginate results
+            paginator = Paginator(queryset, page_size)
+            try:
+                page_obj = paginator.page(page)
+            except EmptyPage:
+                page_obj = paginator.page(paginator.num_pages)
+            
+            products_data = [{
+                'id': product.id,
+                'name': product.name,
+                'price': str(product.price),
+                'unit': product.unit,
+                'quantity': product.quantity,
+                'farmer_name': product.farmer.farm_name,
+                'farmer_rating': str(product.farmer.rating or 0.0),
+                'is_organic': product.is_organic,
+                'image_url': product.image.url if product.image else None,
+                'created_at': product.created_at.isoformat()
+            } for product in page_obj]
+            
+            return JsonResponse({
+                'products': products_data,
+                'current_page': page,
+                'total_pages': paginator.num_pages,
+                'total_results': paginator.count,
+                'query': query
+            })
+        except Exception as e:
+            logger.error(f"Search error: {str(e)}")
+            return JsonResponse({'error': 'Search failed'}, status=500)
+
+# ======================
+# ENHANCED SYSTEM INITIALIZATION
+# ======================
+def initialize_system():
+    # CARICOM Countries with additional data
+    countries = [
+        {'code': 'TT', 'name': 'Trinidad and Tobago', 'currency_code': 'TTD', 'tax_rate': 12.5, 'phone_code': '+1868'},
+        {'code': 'JM', 'name': 'Jamaica', 'currency_code': 'JMD', 'tax_rate': 15.0, 'phone_code': '+1876'},
+        {'code': 'BB', 'name': 'Barbados', 'currency_code': 'BBD', 'tax_rate': 17.5, 'phone_code': '+1246'},
+        {'code': 'GY', 'name': 'Guyana', 'currency_code': 'GYD', 'tax_rate': 16.0, 'phone_code': '+592'},
+        {'code': 'SR', 'name': 'Suriname', 'currency_code': 'SRD', 'tax_rate': 10.0, 'phone_code': '+597'},
+    ]
+    
+    for country in countries:
+        CARICOMCountry.objects.update_or_create(
+            code=country['code'],
+            defaults={
+                'name': country['name'],
+                'currency_code': country['currency_code'],
+                'tax_rate': country['tax_rate'],
+                'phone_code': country['phone_code']
+            }
+        )
+    
+    # Product Categories with icons
+    categories = [
+        {'code': 'FRT', 'name': 'Fruits', 'export_restricted': False, 'icon': '🍎'},
+        {'code': 'VEG', 'name': 'Vegetables', 'export_restricted': False, 'icon': '🥕'},
+        {'code': 'GRA', 'name': 'Grains', 'export_restricted': False, 'icon': '🌾'},
+        {'code': 'LIV', 'name': 'Livestock', 'export_restricted': True, 'icon': '🐄'},
+        {'code': 'DAI', 'name': 'Dairy', 'export_restricted': False, 'icon': '🥛'},
+        {'code': 'SPC', 'name': 'Spices', 'export_restricted': False, 'icon': '🌶️'},
+    ]
+    
+    for category in categories:
+        ProductCategory.objects.update_or_create(
+            code=category['code'],
+            defaults={
+                'name': category['name'],
+                'export_restricted': category['export_restricted'],
+                'icon': category['icon']
+            }
+        )
+
+# ======================
+# URL CONFIGURATION
+# ======================
+urlpatterns = [
+    path('api/cart/', EnhancedCartAPI.as_view()),
+    path('api/cart/<int:item_id>/', EnhancedCartAPI.as_view()),
+    path('api/orders/', EnhancedOrderAPI.as_view()),
+    path('api/orders/<int:order_id>/', EnhancedOrderAPI.as_view()),
+    path('api/reviews/<int:order_id>/', EnhancedReviewAPI.as_view()),
+    path('api/wishlist/', WishlistAPI.as_view()),
+    path('api/wishlist/<int:product_id>/', WishlistAPI.as_view()),
+    path('api/analytics/', AnalyticsAPI.as_view()),
+    path('api/search/', SearchAPI.as_view()),
+]
