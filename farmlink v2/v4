@@ -1,0 +1,2192 @@
+# farmlink_complete.py - Production-Grade Agricultural Marketplace
+import re
+import json
+import logging
+import stripe 
+import requests
+from decimal import Decimal
+from datetime import timedelta, datetime
+from django.db import models, transaction
+from django.contrib.auth.models import AbstractUser
+from django.contrib.auth.hashers import make_password
+from django.contrib.auth import authenticate, login
+from django.http import JsonResponse, HttpResponse
+from django.views.decorators.http import require_http_methods
+from django.views.decorators.csrf import csrf_exempt
+from django.contrib.auth.decorators import login_required
+from django.core.paginator import Paginator, EmptyPage
+from django.db.models import Q, F, CheckConstraint, Sum, Avg, Count, Max, Min
+from django.utils import timezone
+from django.core.validators import MinValueValidator, EmailValidator, URLValidator
+from django.core.cache import cache
+from django.urls import path, include
+from django.conf import settings
+from django.core.files.storage import FileSystemStorage
+from django.core.mail import send_mail
+from django.template.loader import render_to_string
+from geopy.distance import geodesic
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from django.contrib.postgres.search import SearchVector
+import uuid
+import hashlib
+from PIL import Image
+import io
+
+# Enhanced logging configuration
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+# ======================
+# COMPREHENSIVE MODEL DEFINITIONS
+# ======================
+
+class CARICOMCountry(models.Model):
+    code = models.CharField(max_length=2, primary_key=True, editable=False)
+    name = models.CharField(max_length=50, unique=True)
+    currency_code = models.CharField(max_length=3, default='TTD')
+    tax_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0.0)
+    phone_code = models.CharField(max_length=5, default='+1')
+    timezone = models.CharField(max_length=50, default='America/Port_of_Spain')
+    gdp_per_capita = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
+    population = models.BigIntegerField(null=True, blank=True)
+    official_language = models.CharField(max_length=50, default='English')
+    capital_city = models.CharField(max_length=50, blank=True)
+    flag_url = models.URLField(blank=True)
+    agricultural_export_percentage = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    
+    class Meta:
+        verbose_name_plural = "CARICOM Countries"
+        ordering = ['name']
+
+class ProductCategory(models.Model):
+    code = models.CharField(max_length=10, unique=True)
+    name = models.CharField(max_length=50)
+    export_restricted = models.BooleanField(default=False)
+    icon = models.CharField(max_length=50, blank=True)
+    description = models.TextField(blank=True)
+    parent_category = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    seo_keywords = models.TextField(blank=True)
+    featured_image = models.ImageField(upload_to='categories/', null=True, blank=True)
+    
+    class Meta:
+        verbose_name_plural = "Product Categories"
+        indexes = [
+            models.Index(fields=['is_active']),
+            models.Index(fields=['parent_category']),
+        ]
+
+class CertificationType(models.Model):
+    name = models.CharField(max_length=100, unique=True)
+    description = models.TextField(blank=True)
+    issuing_organization = models.CharField(max_length=100)
+    is_international = models.BooleanField(default=False)
+    validity_period_years = models.PositiveIntegerField(default=1)
+    requirements = models.JSONField(default=dict)
+    icon = models.CharField(max_length=50, blank=True)
+    
+    class Meta:
+        verbose_name_plural = "Certification Types"
+
+class Farmer(AbstractUser):
+    # Custom fields
+    farm_name = models.CharField(max_length=100, unique=True)
+    country = models.ForeignKey(CARICOMCountry, on_delete=models.PROTECT)
+    region = models.CharField(max_length=50)
+    certification = models.CharField(max_length=100, blank=True)
+    verification_status = models.CharField(
+        max_length=20,
+        choices=[
+            ('pending', 'Pending'),
+            ('verified', 'Verified'),
+            ('rejected', 'Rejected'),
+            ('suspended', 'Suspended')
+        ],
+        default='pending'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_updated = models.DateTimeField(auto_now=True)
+    location = models.CharField(max_length=100, blank=True)  # 'latitude,longitude'
+    payment_method = models.CharField(max_length=50, blank=True)
+    phone_number = models.CharField(max_length=20, blank=True)
+    bio = models.TextField(blank=True)
+    rating = models.DecimalField(max_digits=3, decimal_places=2, null=True, default=0.0)
+    total_reviews = models.PositiveIntegerField(default=0)
+    farm_size_acres = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    years_experience = models.PositiveIntegerField(default=0)
+    farm_established = models.DateField(null=True, blank=True)
+    specialties = models.ManyToManyField(ProductCategory, blank=True)
+    certifications = models.ManyToManyField(CertificationType, through='FarmerCertification')
+    profile_image = models.ImageField(upload_to='farmers/', null=True, blank=True)
+    cover_image = models.ImageField(upload_to='farmers/cover/', null=True, blank=True)
+    website = models.URLField(blank=True)
+    social_media = models.JSONField(default=dict)  # {facebook: url, instagram: url, ...}
+    business_license = models.CharField(max_length=100, blank=True)
+    tax_id = models.CharField(max_length=50, blank=True)
+    is_premium = models.BooleanField(default=False)
+    premium_since = models.DateTimeField(null=True, blank=True)
+    last_login_ip = models.GenericIPAddressField(null=True, blank=True)
+    referral_code = models.CharField(max_length=20, unique=True, blank=True)
+    referred_by = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True)
+    email_notifications = models.BooleanField(default=True)
+    sms_notifications = models.BooleanField(default=True)
+    preferred_language = models.CharField(max_length=10, default='en')
+    timezone = models.CharField(max_length=50, default='America/Port_of_Spain')
+    is_farmer = models.BooleanField(default=True)
+    is_buyer = models.BooleanField(default=False)
+    
+    # Required for custom user model
+    USERNAME_FIELD = 'farm_name'
+    REQUIRED_FIELDS = ['email', 'country']
+    
+    class Meta:
+        indexes = [
+            models.Index(fields=['verification_status']),
+            models.Index(fields=['country', 'region']),
+            models.Index(fields=['rating']),
+            models.Index(fields=['is_premium']),
+            models.Index(fields=['created_at']),
+        ]
+    
+    def save(self, *args, **kwargs):
+        if not self.referral_code:
+            self.referral_code = self.generate_referral_code()
+        super().save(*args, **kwargs)
+    
+    def generate_referral_code(self):
+        return f"FL{uuid.uuid4().hex[:8].upper()}"
+
+class FarmerCertification(models.Model):
+    farmer = models.ForeignKey(Farmer, on_delete=models.CASCADE)
+    certification = models.ForeignKey(CertificationType, on_delete=models.CASCADE)
+    certificate_number = models.CharField(max_length=100)
+    issued_date = models.DateField()
+    expiry_date = models.DateField()
+    issuing_authority = models.CharField(max_length=100)
+    certificate_image = models.ImageField(upload_to='certificates/', null=True, blank=True)
+    is_verified = models.BooleanField(default=False)
+    verification_date = models.DateTimeField(null=True, blank=True)
+    
+    class Meta:
+        unique_together = ('farmer', 'certification')
+
+class Product(models.Model):
+    UNIT_CHOICES = [
+        ('kg', 'Kilogram'),
+        ('lb', 'Pound'),
+        ('crt', 'Crate'),
+        ('bnd', 'Bundle'),
+        ('dz', 'Dozen'),
+        ('ea', 'Each'),
+        ('bag', 'Bag'),
+        ('box', 'Box'),
+        ('ton', 'Ton'),
+        ('ltr', 'Liter'),
+        ('gal', 'Gallon'),
+    ]
+    
+    GRADE_CHOICES = [
+        ('premium', 'Premium'),
+        ('standard', 'Standard'),
+        ('economy', 'Economy'),
+    ]
+    
+    name = models.CharField(max_length=100)
+    description = models.TextField(blank=True)
+    price = models.DecimalField(
+        max_digits=8, 
+        decimal_places=2,
+        validators=[MinValueValidator(0.01)]
+    )
+    unit = models.CharField(max_length=5, choices=UNIT_CHOICES)
+    quantity = models.PositiveIntegerField()
+    category = models.ForeignKey(ProductCategory, on_delete=models.PROTECT)
+    farmer = models.ForeignKey(Farmer, on_delete=models.CASCADE, related_name='products')
+    harvest_date = models.DateField()
+    is_organic = models.BooleanField(default=False)
+    is_featured = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    image = models.ImageField(
+        upload_to='products/',
+        null=True,
+        blank=True,
+        storage=FileSystemStorage(location='protected_media/')
+    )
+    gallery_images = models.JSONField(default=list)  # List of image URLs
+    views = models.PositiveIntegerField(default=0)
+    likes = models.PositiveIntegerField(default=0)
+    grade = models.CharField(max_length=20, choices=GRADE_CHOICES, default='standard')
+    variety = models.CharField(max_length=100, blank=True)
+    origin_region = models.CharField(max_length=100, blank=True)
+    storage_requirements = models.TextField(blank=True)
+    shelf_life_days = models.PositiveIntegerField(null=True, blank=True)
+    nutritional_info = models.JSONField(default=dict)  # {calories: 50, protein: 2g, ...}
+    certifications = models.ManyToManyField(CertificationType, blank=True)
+    tags = models.JSONField(default=list)  # ['fresh', 'local', 'seasonal']
+    seo_keywords = models.TextField(blank=True)
+    is_available = models.BooleanField(default=True)
+    minimum_order_quantity = models.PositiveIntegerField(default=1)
+    bulk_pricing = models.JSONField(default=dict)  # {10: 0.95, 50: 0.90} - discount percentages
+    related_products = models.ManyToManyField('self', blank=True)
+    weight_kg = models.DecimalField(max_digits=8, decimal_places=3, null=True, blank=True)
+    dimensions_cm = models.CharField(max_length=50, blank=True)  # "LxWxH"
+    packaging_type = models.CharField(max_length=100, blank=True)
+    sustainability_score = models.DecimalField(max_digits=3, decimal_places=1, null=True, blank=True)
+    
+    class Meta:
+        indexes = [
+            models.Index(fields=['category', 'harvest_date']),
+            models.Index(fields=['price', 'quantity']),
+            models.Index(fields=['name', 'description']),
+            models.Index(fields=['created_at']),
+            models.Index(fields=['is_featured']),
+            models.Index(fields=['is_organic']),
+            models.Index(fields=['grade']),
+            models.Index(fields=['farmer', 'is_available']),
+        ]
+        constraints = [
+            CheckConstraint(
+                check=Q(quantity__gte=0),
+                name='non_negative_quantity'
+            )
+        ]
+
+class ProductReview(models.Model):
+    RATING_CHOICES = [(i, str(i)) for i in range(1, 6)]
+    
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='reviews')
+    reviewer = models.ForeignKey(Farmer, on_delete=models.CASCADE)
+    rating = models.PositiveSmallIntegerField(choices=RATING_CHOICES)
+    title = models.CharField(max_length=200, blank=True)
+    comment = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_verified_purchase = models.BooleanField(default=True)
+    helpful_count = models.PositiveIntegerField(default=0)
+    images = models.JSONField(default=list)  # Review photos
+    pros = models.TextField(blank=True)
+    cons = models.TextField(blank=True)
+    
+    class Meta:
+        unique_together = ('product', 'reviewer')
+        indexes = [
+            models.Index(fields=['rating']),
+            models.Index(fields=['created_at']),
+            models.Index(fields=['is_verified_purchase']),
+        ]
+
+class Wishlist(models.Model):
+    user = models.ForeignKey(Farmer, on_delete=models.CASCADE, related_name='wishlists')
+    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    added_at = models.DateTimeField(auto_now_add=True)
+    notes = models.TextField(blank=True)
+    
+    class Meta:
+        unique_together = ('user', 'product')
+        indexes = [
+            models.Index(fields=['added_at']),
+        ]
+
+class Cart(models.Model):
+    user = models.ForeignKey(Farmer, on_delete=models.CASCADE, related_name='carts')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True)
+    session_key = models.CharField(max_length=40, blank=True)
+    notes = models.TextField(blank=True)
+    estimated_total = models.DecimalField(max_digits=10, decimal_places=2, default=0.0)
+    currency = models.CharField(max_length=3, default='TTD')
+    
+    def total(self):
+        return self.items.aggregate(
+            total=Sum(F('quantity') * F('product__price'))
+        )['total'] or Decimal('0.00')
+    
+    def item_count(self):
+        return self.items.aggregate(count=Sum('quantity'))['count'] or 0
+    
+    def update_estimated_total(self):
+        self.estimated_total = self.total()
+        self.save()
+    
+    class Meta:
+        indexes = [
+            models.Index(fields=['is_active']),
+            models.Index(fields=['user', 'is_active']),
+            models.Index(fields=['created_at']),
+        ]
+
+class CartItem(models.Model):
+    cart = models.ForeignKey(Cart, on_delete=models.CASCADE, related_name='items')
+    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    quantity = models.PositiveIntegerField(default=1)
+    added_at = models.DateTimeField(auto_now_add=True)
+    unit_price = models.DecimalField(max_digits=8, decimal_places=2)
+    notes = models.TextField(blank=True)
+    
+    def save(self, *args, **kwargs):
+        if not self.unit_price:
+            self.unit_price = self.product.price
+        super().save(*args, **kwargs)
+    
+    class Meta:
+        unique_together = ('cart', 'product')
+        indexes = [
+            models.Index(fields=['added_at']),
+        ]
+
+class DiscountCode(models.Model):
+    code = models.CharField(max_length=20, unique=True)
+    discount_type = models.CharField(
+        max_length=10,
+        choices=[('percentage', 'Percentage'), ('fixed', 'Fixed Amount')]
+    )
+    discount_value = models.DecimalField(max_digits=8, decimal_places=2)
+    minimum_order_value = models.DecimalField(max_digits=10, decimal_places=2, default=0.0)
+    usage_limit = models.PositiveIntegerField(null=True, blank=True)
+    used_count = models.PositiveIntegerField(default=0)
+    valid_from = models.DateTimeField()
+    valid_until = models.DateTimeField()
+    is_active = models.BooleanField(default=True)
+    applicable_categories = models.ManyToManyField(ProductCategory, blank=True)
+    applicable_products = models.ManyToManyField(Product, blank=True)
+    created_by = models.ForeignKey(Farmer, on_delete=models.SET_NULL, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        indexes = [
+            models.Index(fields=['is_active']),
+            models.Index(fields=['valid_from', 'valid_until']),
+        ]
+
+class Order(models.Model):
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('confirmed', 'Confirmed'),
+        ('paid', 'Paid'),
+        ('processing', 'Processing'),
+        ('shipped', 'Shipped'),
+        ('delivered', 'Delivered'),
+        ('cancelled', 'Cancelled'),
+        ('refunded', 'Refunded'),
+        ('disputed', 'Disputed'),
+    ]
+    
+    buyer = models.ForeignKey(Farmer, on_delete=models.PROTECT, related_name='orders')
+    farmer = models.ForeignKey(Farmer, on_delete=models.PROTECT, related_name='farmer_orders')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    total_amount = models.DecimalField(max_digits=10, decimal_places=2)
+    tax_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0.0)
+    shipping_cost = models.DecimalField(max_digits=10, decimal_places=2, default=0.0)
+    discount_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0.0)
+    payment_intent_id = models.CharField(max_length=100, blank=True)
+    tracking_number = models.CharField(max_length=100, blank=True)
+    shipping_address = models.TextField()
+    billing_address = models.TextField(blank=True)
+    notes = models.TextField(blank=True)
+    estimated_delivery = models.DateField(null=True, blank=True)
+    actual_delivery = models.DateField(null=True, blank=True)
+    currency = models.CharField(max_length=3, default='TTD')
+    discount_code = models.ForeignKey(DiscountCode, on_delete=models.SET_NULL, null=True, blank=True)
+    subtotal = models.DecimalField(max_digits=10, decimal_places=2)
+    order_number = models.CharField(max_length=20, unique=True, blank=True)
+    source_ip = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.TextField(blank=True)
+    referral_used = models.ForeignKey(Farmer, on_delete=models.SET_NULL, null=True, blank=True, related_name='referrals_used')
+    
+    def save(self, *args, **kwargs):
+        if not self.order_number:
+            self.order_number = self.generate_order_number()
+        super().save(*args, **kwargs)
+    
+    def generate_order_number(self):
+        timestamp = datetime.now().strftime('%Y%m%d')
+        random_part = uuid.uuid4().hex[:6].upper()
+        return f"FL{timestamp}{random_part}"
+    
+    class Meta:
+        indexes = [
+            models.Index(fields=['status']),
+            models.Index(fields=['created_at']),
+            models.Index(fields=['buyer']),
+            models.Index(fields=['farmer']),
+            models.Index(fields=['order_number']),
+        ]
+
+class OrderItem(models.Model):
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='items')
+    product = models.ForeignKey(Product, on_delete=models.PROTECT)
+    quantity = models.PositiveIntegerField()
+    price = models.DecimalField(max_digits=8, decimal_places=2)
+    unit = models.CharField(max_length=5)
+    farmer_notes = models.TextField(blank=True)
+    buyer_notes = models.TextField(blank=True)
+    fulfillment_status = models.CharField(
+        max_length=20,
+        choices=[
+            ('pending', 'Pending'),
+            ('packed', 'Packed'),
+            ('shipped', 'Shipped'),
+            ('delivered', 'Delivered'),
+        ],
+        default='pending'
+    )
+    
+    class Meta:
+        indexes = [
+            models.Index(fields=['fulfillment_status']),
+        ]
+
+class Review(models.Model):
+    RATING_CHOICES = [(i, str(i)) for i in range(1, 6)]
+    
+    order = models.OneToOneField(Order, on_delete=models.CASCADE, related_name='review')
+    rating = models.PositiveSmallIntegerField(choices=RATING_CHOICES)
+    comment = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_verified_purchase = models.BooleanField(default=True)
+    title = models.CharField(max_length=200, blank=True)
+    images = models.JSONField(default=list)
+    pros = models.TextField(blank=True)
+    cons = models.TextField(blank=True)
+    response = models.TextField(blank=True)
+    responded_at = models.DateTimeField(null=True, blank=True)
+    responder = models.ForeignKey(Farmer, on_delete=models.SET_NULL, null=True, blank=True, related_name='responses')
+    
+    class Meta:
+        indexes = [
+            models.Index(fields=['rating']),
+            models.Index(fields=['created_at']),
+        ]
+
+class Notification(models.Model):
+    TYPE_CHOICES = [
+        ('order', 'Order Update'),
+        ('payment', 'Payment'),
+        ('system', 'System'),
+        ('message', 'Message'),
+        ('promotion', 'Promotion'),
+        ('review', 'Review'),
+        ('alert', 'Alert'),
+    ]
+    
+    user = models.ForeignKey(Farmer, on_delete=models.CASCADE, related_name='notifications')
+    message = models.TextField()
+    notification_type = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    related_object_id = models.PositiveIntegerField(null=True, blank=True)
+    url = models.URLField(blank=True)
+    priority = models.CharField(
+        max_length=10,
+        choices=[('low', 'Low'), ('medium', 'Medium'), ('high', 'High')],
+        default='medium'
+    )
+    expires_at = models.DateTimeField(null=True, blank=True)
+    is_archived = models.BooleanField(default=False)
+    
+    class Meta:
+        indexes = [
+            models.Index(fields=['is_read']),
+            models.Index(fields=['created_at']),
+            models.Index(fields=['notification_type']),
+            models.Index(fields=['priority']),
+            models.Index(fields=['user', 'is_read']),
+        ]
+
+class Message(models.Model):
+    sender = models.ForeignKey(Farmer, on_delete=models.CASCADE, related_name='sent_messages')
+    recipient = models.ForeignKey(Farmer, on_delete=models.CASCADE, related_name='received_messages')
+    subject = models.CharField(max_length=200)
+    content = models.TextField()
+    sent_at = models.DateTimeField(auto_now_add=True)
+    is_read = models.BooleanField(default=False)
+    parent_message = models.ForeignKey('self', on_delete=models.CASCADE, null=True, blank=True)
+    is_archived = models.BooleanField(default=False)
+    attachments = models.JSONField(default=list)
+    
+    class Meta:
+        indexes = [
+            models.Index(fields=['sent_at']),
+            models.Index(fields=['is_read']),
+            models.Index(fields=['sender', 'recipient']),
+        ]
+
+class SubscriptionPlan(models.Model):
+    name = models.CharField(max_length=50, unique=True)
+    description = models.TextField()
+    price = models.DecimalField(max_digits=8, decimal_places=2)
+    currency = models.CharField(max_length=3, default='TTD')
+    billing_cycle = models.CharField(
+        max_length=10,
+        choices=[('monthly', 'Monthly'), ('annual', 'Annual')],
+        default='monthly'
+    )
+    features = models.JSONField(default=dict)
+    max_products = models.IntegerField(default=100)
+    max_orders = models.IntegerField(default=1000)
+    support_level = models.CharField(
+        max_length=20,
+        choices=[('basic', 'Basic'), ('priority', 'Priority'), ('premium', 'Premium')],
+        default='basic'
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    featured = models.BooleanField(default=False)
+    
+    class Meta:
+        indexes = [
+            models.Index(fields=['is_active']),
+            models.Index(fields=['billing_cycle']),
+            models.Index(fields=['featured']),
+        ]
+
+class FarmerSubscription(models.Model):
+    farmer = models.ForeignKey(Farmer, on_delete=models.CASCADE)
+    plan = models.ForeignKey(SubscriptionPlan, on_delete=models.CASCADE)
+    start_date = models.DateTimeField(auto_now_add=True)
+    end_date = models.DateTimeField()
+    is_active = models.BooleanField(default=True)
+    payment_method = models.CharField(max_length=50)
+    stripe_subscription_id = models.CharField(max_length=100, blank=True)
+    auto_renew = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        indexes = [
+            models.Index(fields=['is_active']),
+            models.Index(fields=['end_date']),
+        ]
+
+class InventoryBatch(models.Model):
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='inventory_batches')
+    batch_number = models.CharField(max_length=50)
+    quantity = models.PositiveIntegerField()
+    unit_cost = models.DecimalField(max_digits=8, decimal_places=2)
+    received_date = models.DateField()
+    expiry_date = models.DateField(null=True, blank=True)
+    supplier = models.CharField(max_length=100, blank=True)
+    notes = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        unique_together = ('product', 'batch_number')
+        indexes = [
+            models.Index(fields=['is_active']),
+            models.Index(fields=['expiry_date']),
+        ]
+
+class ShippingMethod(models.Model):
+    name = models.CharField(max_length=50)
+    description = models.TextField(blank=True)
+    base_cost = models.DecimalField(max_digits=8, decimal_places=2)
+    cost_per_km = models.DecimalField(max_digits=8, decimal_places=2, default=0.0)
+    estimated_delivery_days = models.PositiveIntegerField()
+    is_active = models.BooleanField(default=True)
+    countries = models.ManyToManyField(CARICOMCountry, blank=True)
+    weight_limit_kg = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    tracking_available = models.BooleanField(default=True)
+    insurance_included = models.BooleanField(default=False)
+    
+    class Meta:
+        indexes = [
+            models.Index(fields=['is_active']),
+        ]
+
+class FAQ(models.Model):
+    question = models.CharField(max_length=300)
+    answer = models.TextField()
+    category = models.CharField(max_length=50, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    priority = models.PositiveIntegerField(default=0)
+    
+    class Meta:
+        verbose_name = "FAQ"
+        verbose_name_plural = "FAQs"
+        indexes = [
+            models.Index(fields=['is_active']),
+            models.Index(fields=['category']),
+            models.Index(fields=['priority']),
+        ]
+
+class BlogPost(models.Model):
+    title = models.CharField(max_length=200)
+    slug = models.SlugField(unique=True)
+    content = models.TextField()
+    excerpt = models.TextField(blank=True)
+    author = models.ForeignKey(Farmer, on_delete=models.CASCADE)
+    featured_image = models.ImageField(upload_to='blog/', null=True, blank=True)
+    is_published = models.BooleanField(default=False)
+    published_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    tags = models.JSONField(default=list)
+    seo_keywords = models.TextField(blank=True)
+    views = models.PositiveIntegerField(default=0)
+    likes = models.PositiveIntegerField(default=0)
+    category = models.CharField(max_length=50, blank=True)
+    
+    class Meta:
+        indexes = [
+            models.Index(fields=['is_published']),
+            models.Index(fields=['published_at']),
+            models.Index(fields=['category']),
+        ]
+
+class SupportTicket(models.Model):
+    PRIORITY_CHOICES = [
+        ('low', 'Low'),
+        ('medium', 'Medium'),
+        ('high', 'High'),
+        ('urgent', 'Urgent'),
+    ]
+    
+    STATUS_CHOICES = [
+        ('open', 'Open'),
+        ('in_progress', 'In Progress'),
+        ('resolved', 'Resolved'),
+        ('closed', 'Closed'),
+    ]
+    
+    user = models.ForeignKey(Farmer, on_delete=models.CASCADE)
+    subject = models.CharField(max_length=200)
+    description = models.TextField()
+    priority = models.CharField(max_length=10, choices=PRIORITY_CHOICES, default='medium')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='open')
+    category = models.CharField(max_length=50)
+    assigned_to = models.ForeignKey(Farmer, on_delete=models.SET_NULL, null=True, blank=True, related_name='assigned_tickets')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    attachments = models.JSONField(default=list)
+    notes = models.TextField(blank=True)
+    
+    class Meta:
+        indexes = [
+            models.Index(fields=['status']),
+            models.Index(fields=['priority']),
+            models.Index(fields=['category']),
+            models.Index(fields=['created_at']),
+        ]
+
+# ======================
+# COMPREHENSIVE UTILITIES & SERVICES
+# ======================
+
+class DataValidator:
+    @staticmethod
+    def validate_password(password):
+        if len(password) < 8:
+            return False, "Password must be at least 8 characters"
+        if not re.search(r"[A-Z]", password):
+            return False, "Password must contain an uppercase letter"
+        if not re.search(r"[a-z]", password):
+            return False, "Password must contain a lowercase letter"
+        if not re.search(r"[0-9]", password):
+            return False, "Password must contain a digit"
+        if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", password):
+            return False, "Password must contain a special character"
+        return True, ""
+
+    @staticmethod
+    def validate_email(email):
+        validator = EmailValidator()
+        try:
+            validator(email)
+            return True, ""
+        except:
+            return False, "Invalid email format"
+
+    @staticmethod
+    def sanitize_input(text):
+        if not text:
+            return text
+        # Remove potentially dangerous characters
+        sanitized = re.sub(r'[<>"\']', '', str(text))
+        # Limit length
+        return sanitized.strip()[:500]
+    
+    @staticmethod
+    def validate_phone(phone):
+        pattern = r'^\+?[\d\s\-\(\)]{10,20}$'
+        return bool(re.match(pattern, phone))
+    
+    @staticmethod
+    def validate_location(location):
+        try:
+            if not location:
+                return False, "Location is required"
+            parts = location.split(',')
+            if len(parts) != 2:
+                return False, "Invalid location format"
+            lat, lon = float(parts[0]), float(parts[1])
+            if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+                return False, "Invalid coordinates"
+            return True, ""
+        except:
+            return False, "Invalid location format"
+    
+    @staticmethod
+    def validate_url(url):
+        validator = URLValidator()
+        try:
+            validator(url)
+            return True, ""
+        except:
+            return False, "Invalid URL format"
+
+class GeoService:
+    @staticmethod
+    def calculate_shipping_cost(origin, destination, weight_kg=1.0, method='standard'):
+        try:
+            origin_coords = tuple(map(float, origin.split(',')))
+            dest_coords = tuple(map(float, destination.split(',')))
+            
+            distance = geodesic(origin_coords, dest_coords).kilometers
+            
+            # Get shipping method rates
+            shipping_method = ShippingMethod.objects.filter(
+                name__iexact=method,
+                is_active=True
+            ).first()
+            
+            if not shipping_method:
+                shipping_method = ShippingMethod.objects.filter(is_active=True).first()
+            
+            if shipping_method:
+                base_cost = shipping_method.base_cost
+                per_km = shipping_method.cost_per_km
+                cost = base_cost + (per_km * Decimal(str(distance)))
+                
+                # Apply weight factor
+                if weight_kg > 1:
+                    cost *= Decimal(str(1 + (weight_kg * 0.1)))
+            else:
+                # Default calculation
+                base_cost = Decimal('50.00')
+                per_km = Decimal('1.20')
+                cost = base_cost + (per_km * Decimal(str(distance)))
+            
+            return max(cost, Decimal('50.00'))  # Minimum shipping cost
+        except Exception as e:
+            logger.error(f"Shipping cost calculation error: {str(e)}")
+            return Decimal('100.00')
+
+class PaymentService:
+    def __init__(self):
+        stripe.api_key = getattr(settings, 'STRIPE_SECRET_KEY', '')
+    
+    def create_payment_intent(self, amount, currency, metadata=None):
+        try:
+            return stripe.PaymentIntent.create(
+                amount=int(amount * 100),  # Convert to cents
+                currency=currency.lower(),
+                metadata=metadata or {},
+                automatic_payment_methods={"enabled": True},
+            )
+        except stripe.error.StripeError as e:
+            logger.error(f"Stripe error: {str(e)}")
+            return None
+    
+    def confirm_payment(self, payment_intent_id):
+        try:
+            return stripe.PaymentIntent.confirm(payment_intent_id)
+        except stripe.error.StripeError as e:
+            logger.error(f"Payment confirmation error: {str(e)}")
+            return None
+    
+    def create_subscription(self, customer_id, plan_price_id):
+        try:
+            return stripe.Subscription.create(
+                customer=customer_id,
+                items=[{'price': plan_price_id}],
+                payment_behavior='default_incomplete',
+                expand=['latest_invoice.payment_intent'],
+            )
+        except stripe.error.StripeError as e:
+            logger.error(f"Subscription creation error: {str(e)}")
+            return None
+
+class NotificationService:
+    @staticmethod
+    def send_notification(user, message, notif_type, related_id=None, url="", priority='medium'):
+        notification = Notification.objects.create(
+            user=user,
+            message=message,
+            notification_type=notif_type,
+            related_object_id=related_id,
+            url=url,
+            priority=priority
+        )
+        
+        # Send email for critical notifications
+        if notif_type in ['order', 'payment'] and user.email_notifications:
+            subject = f"FarmLink: {notif_type.capitalize()} Update"
+            html_message = render_to_string('emails/notification.html', {
+                'user': user,
+                'message': message,
+                'notification_type': notif_type
+            })
+            send_mail(
+                subject,
+                message,
+                settings.DEFAULT_FROM_EMAIL,
+                [user.email],
+                html_message=html_message,
+                fail_silently=True,
+            )
+        
+        return notification
+    
+    @staticmethod
+    def send_bulk_notification(users, message, notif_type, priority='medium'):
+        notifications = []
+        for user in users:
+            notification = Notification(
+                user=user,
+                message=message,
+                notification_type=notif_type,
+                priority=priority
+            )
+            notifications.append(notification)
+        
+        Notification.objects.bulk_create(notifications)
+        return notifications
+
+class SearchService:
+    @staticmethod
+    def advanced_search(query, category=None, min_price=None, max_price=None, 
+                       is_organic=None, sort_by='relevance', farmer_rating=None,
+                       certifications=None, location=None, radius_km=None):
+        # Use PostgreSQL full-text search if available
+        if getattr(settings, 'USE_POSTGRES', False):
+            search_vector = SearchVector('name', 'description', 'farmer__farm_name')
+            queryset = Product.objects.annotate(search=search_vector).filter(search=query)
+        else:
+            # Fallback to basic search
+            queryset = Product.objects.filter(
+                Q(name__icontains=query) |
+                Q(description__icontains=query) |
+                Q(farmer__farm_name__icontains=query)
+            )
+        
+        # Apply filters
+        if category:
+            queryset = queryset.filter(category__code=category)
+        if min_price:
+            queryset = queryset.filter(price__gte=min_price)
+        if max_price:
+            queryset = queryset.filter(price__lte=max_price)
+        if is_organic is not None:
+            queryset = queryset.filter(is_organic=is_organic)
+        if farmer_rating:
+            queryset = queryset.filter(farmer__rating__gte=farmer_rating)
+        if certifications:
+            queryset = queryset.filter(certifications__name__in=certifications)
+        if location and radius_km:
+            # This would require more complex geospatial queries
+            pass
+        
+        # Apply sorting
+        sort_options = {
+            'price_asc': 'price',
+            'price_desc': '-price',
+            'date': '-created_at',
+            'popularity': '-views',
+            'rating': '-farmer__rating',
+            'name': 'name'
+        }
+        if sort_by in sort_options:
+            queryset = queryset.order_by(sort_options[sort_by])
+        else:
+            queryset = queryset.order_by('-created_at')
+        
+        return queryset.distinct()
+
+class AnalyticsService:
+    @staticmethod
+    def get_farmer_dashboard_data(farmer):
+        # Sales summary
+        thirty_days_ago = timezone.now() - timedelta(days=30)
+        ninety_days_ago = timezone.now() - timedelta(days=90)
+        
+        recent_orders = Order.objects.filter(
+            farmer=farmer,
+            created_at__gte=thirty_days_ago
+        )
+        
+        total_sales = recent_orders.aggregate(
+            total=Sum('total_amount')
+        )['total'] or Decimal('0.00')
+        
+        order_count = recent_orders.count()
+        
+        # Recent orders
+        recent_orders_data = recent_orders.order_by('-created_at')[:10].values(
+            'id', 'created_at', 'total_amount', 'status', 'buyer__farm_name'
+        )
+        
+        # Top products
+        top_products = OrderItem.objects.filter(
+            order__farmer=farmer,
+            order__created_at__gte=ninety_days_ago
+        ).values('product__name').annotate(
+            total_quantity=Sum('quantity'),
+            total_revenue=Sum(F('quantity') * F('price'))
+        ).order_by('-total_revenue')[:5]
+        
+        # Monthly trend
+        monthly_data = recent_orders.extra(
+            select={'month': "EXTRACT(month FROM created_at)"}
+        ).values('month').annotate(
+            total=Sum('total_amount'),
+            count=Count('id')
+        ).order_by('month')
+        
+        # Customer insights
+        customer_count = Order.objects.filter(
+            farmer=farmer,
+            created_at__gte=ninety_days_ago
+        ).values('buyer').distinct().count()
+        
+        # Product performance
+        product_stats = Product.objects.filter(farmer=farmer).aggregate(
+            total_products=Count('id'),
+            avg_price=Avg('price'),
+            total_inventory=Sum('quantity')
+        )
+        
+        return {
+            'total_sales': str(total_sales),
+            'order_count': order_count,
+            'customer_count': customer_count,
+            'recent_orders': list(recent_orders_data),
+            'top_products': list(top_products),
+            'monthly_trend': list(monthly_data),
+            'product_stats': product_stats
+        }
+    
+    @staticmethod
+    def get_market_insights():
+        # Overall market data
+        total_farmers = Farmer.objects.filter(verification_status='verified').count()
+        total_products = Product.objects.filter(is_available=True).count()
+        total_orders = Order.objects.filter(status='delivered').count()
+        
+        # Popular categories
+        popular_categories = Product.objects.filter(is_available=True).values(
+            'category__name'
+        ).annotate(
+            product_count=Count('id'),
+            avg_price=Avg('price')
+        ).order_by('-product_count')[:5]
+        
+        # Top rated farmers
+        top_farmers = Farmer.objects.filter(
+            verification_status='verified',
+            total_reviews__gt=0
+        ).order_by('-rating')[:10].values(
+            'farm_name', 'rating', 'total_reviews'
+        )
+        
+        return {
+            'market_size': {
+                'total_farmers': total_farmers,
+                'total_products': total_products,
+                'total_orders': total_orders
+            },
+            'popular_categories': list(popular_categories),
+            'top_farmers': list(top_farmers)
+        }
+
+class ImageService:
+    @staticmethod
+    def optimize_image(image_field, max_size=(800, 600)):
+        """Optimize image size and quality"""
+        try:
+            img = Image.open(image_field)
+            img.thumbnail(max_size, Image.Resampling.LANCZOS)
+            
+            # Convert to RGB if necessary
+            if img.mode in ('RGBA', 'LA', 'P'):
+                img = img.convert('RGB')
+            
+            # Save with optimized quality
+            output = io.BytesIO()
+            img.save(output, format='JPEG', quality=85, optimize=True)
+            output.seek(0)
+            
+            return output
+        except Exception as e:
+            logger.error(f"Image optimization error: {str(e)}")
+            return None
+
+class DiscountService:
+    @staticmethod
+    def apply_discount_code(code, cart_total, user=None):
+        try:
+            discount = DiscountCode.objects.get(
+                code=code,
+                is_active=True,
+                valid_from__lte=timezone.now(),
+                valid_until__gte=timezone.now()
+            )
+            
+            # Check usage limits
+            if discount.usage_limit and discount.used_count >= discount.usage_limit:
+                return None, "Discount code usage limit exceeded"
+            
+            # Check minimum order value
+            if cart_total < discount.minimum_order_value:
+                return None, f"Minimum order value is {discount.minimum_order_value}"
+            
+            # Calculate discount
+            if discount.discount_type == 'percentage':
+                discount_amount = cart_total * (discount.discount_value / 100)
+            else:  # fixed amount
+                discount_amount = min(discount.discount_value, cart_total)
+            
+            return discount, discount_amount
+            
+        except DiscountCode.DoesNotExist:
+            return None, "Invalid discount code"
+    
+    @staticmethod
+    def generate_discount_code(length=8):
+        return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
+
+# ======================
+# COMPREHENSIVE API VIEWS
+# ======================
+
+class EnhancedCartAPI(APIView):
+    @login_required
+    def get(self, request):
+        cart, _ = Cart.objects.get_or_create(user=request.user, is_active=True)
+        items = cart.items.select_related('product', 'product__farmer').all()
+        
+        cart_data = {
+            'id': cart.id,
+            'total': str(cart.total()),
+            'item_count': cart.item_count(),
+            'currency': cart.currency,
+            'estimated_shipping': str(Decimal('100.00')),  # Default shipping
+            'estimated_tax': str(cart.total() * (request.user.country.tax_rate / 100)),
+            'estimated_total': str(cart.total() * (1 + request.user.country.tax_rate / 100) + Decimal('100.00')),
+            'items': [{
+                'id': item.id,
+                'product_id': item.product.id,
+                'name': item.product.name,
+                'price': str(item.product.price),
+                'unit_price': str(item.unit_price),
+                'quantity': item.quantity,
+                'subtotal': str(item.unit_price * item.quantity),
+                'farmer_name': item.product.farmer.farm_name,
+                'image_url': item.product.image.url if item.product.image else None,
+                'unit': item.product.unit,
+                'available_quantity': item.product.quantity
+            } for item in items]
+        }
+        return JsonResponse(cart_data)
+    
+    @login_required
+    def post(self, request):
+        try:
+            data = json.loads(request.body)
+            product_id = data.get('product_id')
+            quantity = int(data.get('quantity', 1))
+            notes = DataValidator.sanitize_input(data.get('notes', ''))
+            
+            if quantity <= 0:
+                return JsonResponse({'error': 'Invalid quantity'}, status=400)
+            
+            product = Product.objects.get(id=product_id)
+            
+            if product.quantity < quantity:
+                return JsonResponse({'error': 'Insufficient stock'}, status=400)
+            
+            cart, _ = Cart.objects.get_or_create(user=request.user, is_active=True)
+            
+            # Update or create cart item
+            cart_item, created = CartItem.objects.get_or_create(
+                cart=cart,
+                product=product,
+                defaults={
+                    'quantity': quantity,
+                    'notes': notes
+                }
+            )
+            
+            if not created:
+                new_quantity = cart_item.quantity + quantity
+                if product.quantity < new_quantity:
+                    return JsonResponse({'error': 'Insufficient stock'}, status=400)
+                cart_item.quantity = new_quantity
+                cart_item.notes = notes
+                cart_item.save()
+            
+            # Update cart estimated total
+            cart.update_estimated_total()
+            
+            # Update product views
+            product.views = F('views') + 1
+            product.save()
+            
+            return JsonResponse({
+                'status': 'success',
+                'message': f'Added {quantity} {product.name} to cart',
+                'cart_item_count': cart.item_count()
+            }, status=201)
+            
+        except Product.DoesNotExist:
+            return JsonResponse({'error': 'Product not found'}, status=404)
+        except json.JSONDecodeError:
+            return JsonResponse({'error': 'Invalid JSON data'}, status=400)
+        except Exception as e:
+            logger.error(f"Cart error: {str(e)}")
+            return JsonResponse({'error': 'Failed to add item to cart'}, status=500)
+    
+    @login_required
+    def put(self, request, item_id):
+        try:
+            data = json.loads(request.body)
+            quantity = int(data.get('quantity', 1))
+            notes = DataValidator.sanitize_input(data.get('notes', ''))
+            
+            if quantity <= 0:
+                return JsonResponse({'error': 'Invalid quantity'}, status=400)
+            
+            cart = Cart.objects.get(user=request.user, is_active=True)
+            cart_item = CartItem.objects.get(cart=cart, id=item_id)
+            
+            if cart_item.product.quantity < quantity:
+                return JsonResponse({'error': 'Insufficient stock'}, status=400)
+            
+            cart_item.quantity = quantity
+            cart_item.notes = notes
+            cart_item.save()
+            
+            # Update cart estimated total
+            cart.update_estimated_total()
+            
+            return JsonResponse({
+                'status': 'success',
+                'message': f'Updated {cart_item.product.name} quantity to {quantity}'
+            })
+            
+        except (Cart.DoesNotExist, CartItem.DoesNotExist):
+            return JsonResponse({'error': 'Item not found'}, status=404)
+        except Exception as e:
+            logger.error(f"Cart update error: {str(e)}")
+            return JsonResponse({'error': 'Failed to update cart item'}, status=500)
+    
+    @login_required
+    def delete(self, request, item_id):
+        try:
+            cart = Cart.objects.get(user=request.user, is_active=True)
+            cart_item = CartItem.objects.get(cart=cart, id=item_id)
+            cart_item.delete()
+            
+            # Update cart estimated total
+            cart.update_estimated_total()
+            
+            return JsonResponse({
+                'status': 'success',
+                'message': 'Item removed from cart',
+                'cart_item_count': cart.item_count()
+            })
+        except (Cart.DoesNotExist, CartItem.DoesNotExist):
+            return JsonResponse({'error': 'Item not found'}, status=404)
+
+class EnhancedOrderAPI(APIView):
+    @login_required
+    def post(self, request):
+        try:
+            data = json.loads(request.body)
+            shipping_address = DataValidator.sanitize_input(data.get('shipping_address'))
+            billing_address = DataValidator.sanitize_input(data.get('billing_address', shipping_address))
+            notes = DataValidator.sanitize_input(data.get('notes', ''))
+            discount_code = data.get('discount_code', '').strip()
+            
+            if not shipping_address:
+                return JsonResponse({'error': 'Shipping address required'}, status=400)
+            
+            cart = Cart.objects.get(user=request.user, is_active=True)
+            items = cart.items.select_related('product').all()
+            
+            if not items:
+                return JsonResponse({'error': 'Cart is empty'}, status=400)
+            
+            with transaction.atomic():
+                # Calculate subtotal
+                subtotal = sum(item.unit_price * item.quantity for item in items)
+                
+                # Apply discount
+                discount_amount = Decimal('0.00')
+                discount_obj = None
+                if discount_code:
+                    discount_obj, discount_amount = DiscountService.apply_discount_code(
+                        discount_code, subtotal, request.user
+                    )
+                    if discount_obj is None:
+                        return JsonResponse({'error': discount_amount}, status=400)
+                
+                # Calculate tax
+                tax_rate = request.user.country.tax_rate / 100
+                tax_amount = (subtotal - discount_amount) * Decimal(str(tax_rate))
+                
+                # Calculate shipping cost
+                shipping_cost = Decimal('100.00')
+                if request.user.location and items:
+                    farmer_location = items[0].product.farmer.location
+                    if farmer_location:
+                        total_weight = sum(
+                            (item.product.weight_kg or Decimal('1.0')) * item.quantity 
+                            for item in items
+                        )
+                        shipping_cost = GeoService.calculate_shipping_cost(
+                            farmer_location, 
+                            request.user.location,
+                            float(total_weight)
+                        )
+                
+                total_amount = (subtotal - discount_amount) + tax_amount + shipping_cost
+                
+                # Create order
+                order = Order.objects.create(
+                    buyer=request.user,
+                    farmer=items[0].product.farmer,
+                    subtotal=subtotal,
+                    total_amount=total_amount,
+                    tax_amount=tax_amount,
+                    shipping_cost=shipping_cost,
+                    discount_amount=discount_amount,
+                    discount_code=discount_obj,
+                    shipping_address=shipping_address,
+                    billing_address=billing_address,
+                    notes=notes,
+                    estimated_delivery=timezone.now().date() + timedelta(days=3),
+                    currency=request.user.country.currency_code,
+                    source_ip=request.META.get('REMOTE_ADDR'),
+                    user_agent=request.META.get('HTTP_USER_AGENT', ''),
+                )
+                
+                # Create order items and update inventory
+                for item in items:
+                    OrderItem.objects.create(
+                        order=order,
+                        product=item.product,
+                        quantity=item.quantity,
+                        price=item.unit_price,
+                        unit=item.product.unit
+                    )
+                    
+                    # Update product quantity
+                    item.product.quantity = F('quantity') - item.quantity
+                    item.product.save()
+                
+                # Update discount code usage
+                if discount_obj:
+                    discount_obj.used_count = F('used_count') + 1
+                    discount_obj.save()
+                
+                # Create payment intent
+                payment_service = PaymentService()
+                payment_intent = payment_service.create_payment_intent(
+                    amount=total_amount,
+                    currency=request.user.country.currency_code,
+                    metadata={'order_id': order.id}
+                )
+                
+                if not payment_intent:
+                    raise Exception("Payment processing failed")
+                
+                order.payment_intent_id = payment_intent.id
+                order.save()
+                
+                # Deactivate cart
+                cart.is_active = False
+                cart.save()
+                
+                # Send notifications
+                NotificationService.send_notification(
+                    request.user,
+                    f"Order #{order.order_number} created. Total: {request.user.country.currency_code} {total_amount}",
+                    'order',
+                    order.id,
+                    f'/orders/{order.id}',
+                    'high'
+                )
+                
+                NotificationService.send_notification(
+                    order.farmer,
+                    f"New order #{order.order_number} from {request.user.farm_name}",
+                    'order',
+                    order.id,
+                    f'/farmer/orders/{order.id}',
+                    'high'
+                )
+                
+                return JsonResponse({
+                    'status': 'success',
+                    'order_id': order.id,
+                    'order_number': order.order_number,
+                    'client_secret': payment_intent.client_secret,
+                    'total_amount': str(total_amount),
+                    'currency': order.currency
+                }, status=201)
+        
+        except Cart.DoesNotExist:
+            return JsonResponse({'error': 'Active cart not found'}, status=404)
+        except Exception as e:
+            logger.error(f"Order creation error: {str(e)}")
+            return JsonResponse({'error': 'Order processing failed'}, status=500)
+    
+    @login_required
+    def get(self, request):
+        try:
+            page = int(request.GET.get('page', 1))
+            page_size = min(int(request.GET.get('page_size', 10)), 50)
+            status_filter = request.GET.get('status')
+            
+            orders = Order.objects.filter(buyer=request.user)
+            if status_filter:
+                orders = orders.filter(status=status_filter)
+            
+            orders = orders.order_by('-created_at')
+            paginator = Paginator(orders, page_size)
+            
+            try:
+                page_obj = paginator.page(page)
+            except EmptyPage:
+                return JsonResponse({'orders': [], 'total_pages': paginator.num_pages})
+            
+            orders_data = [{
+                'id': order.id,
+                'order_number': order.order_number,
+                'created_at': order.created_at.isoformat(),
+                'status': order.status,
+                'total_amount': str(order.total_amount),
+                'currency': order.currency,
+                'farmer_name': order.farmer.farm_name,
+                'item_count': order.items.count(),
+                'estimated_delivery': order.estimated_delivery.isoformat() if order.estimated_delivery else None
+            } for order in page_obj]
+            
+            return JsonResponse({
+                'orders': orders_data,
+                'current_page': page,
+                'total_pages': paginator.num_pages,
+                'total_orders': paginator.count
+            })
+        except Exception as e:
+            logger.error(f"Order list error: {str(e)}")
+            return JsonResponse({'error': 'Failed to retrieve orders'}, status=500)
+
+class EnhancedReviewAPI(APIView):
+    @login_required
+    def post(self, request, order_id):
+        try:
+            data = json.loads(request.body)
+            rating = int(data.get('rating'))
+            comment = DataValidator.sanitize_input(data.get('comment', ''))
+            title = DataValidator.sanitize_input(data.get('title', ''))
+            pros = DataValidator.sanitize_input(data.get('pros', ''))
+            cons = DataValidator.sanitize_input(data.get('cons', ''))
+            images = data.get('images', [])
+            
+            if not (1 <= rating <= 5):
+                return JsonResponse({'error': 'Rating must be between 1 and 5'}, status=400)
+            
+            order = Order.objects.get(
+                id=order_id, 
+                buyer=request.user, 
+                status='delivered'
+            )
+            
+            # Create or update review
+            review, created = Review.objects.update_or_create(
+                order=order,
+                defaults={
+                    'rating': rating,
+                    'comment': comment,
+                    'title': title,
+                    'pros': pros,
+                    'cons': cons,
+                    'images': images
+                }
+            )
+            
+            # Update farmer rating
+            farmer = order.farmer
+            farmer_reviews = Review.objects.filter(
+                order__farmer=farmer
+            ).aggregate(
+                avg_rating=Avg('rating'),
+                total_reviews=Count('id')
+            )
+            
+            farmer.rating = farmer_reviews['avg_rating'] or 0.0
+            farmer.total_reviews = farmer_reviews['total_reviews']
+            farmer.save()
+            
+            # Send notification to farmer
+            NotificationService.send_notification(
+                farmer,
+                f"You received a {rating}-star review from {request.user.farm_name}",
+                'review',
+                order.id,
+                f'/farmer/orders/{order.id}'
+            )
+            
+            return JsonResponse({
+                'status': 'success',
+                'message': 'Review submitted successfully'
+            }, status=201)
+            
+        except Order.DoesNotExist:
+            return JsonResponse({'error': 'Order not found or not eligible for review'}, status=404)
+        except (ValueError, TypeError):
+            return JsonResponse({'error': 'Invalid rating value'}, status=400)
+        except Exception as e:
+            logger.error(f"Review error: {str(e)}")
+            return JsonResponse({'error': 'Failed to submit review'}, status=500)
+    
+    @login_required
+    def get(self, request, order_id):
+        try:
+            review = Review.objects.get(order_id=order_id)
+            return JsonResponse({
+                'id': review.id,
+                'rating': review.rating,
+                'title': review.title,
+                'comment': review.comment,
+                'pros': review.pros,
+                'cons': review.cons,
+                'images': review.images,
+                'created_at': review.created_at.isoformat(),
+                'updated_at': review.updated_at.isoformat()
+            })
+        except Review.DoesNotExist:
+            return JsonResponse({'error': 'Review not found'}, status=404)
+
+class WishlistAPI(APIView):
+    @login_required
+    def post(self, request):
+        try:
+            data = json.loads(request.body)
+            product_id = data.get('product_id')
+            notes = DataValidator.sanitize_input(data.get('notes', ''))
+            
+            product = Product.objects.get(id=product_id)
+            
+            wishlist_item, created = Wishlist.objects.get_or_create(
+                user=request.user,
+                product=product,
+                defaults={'notes': notes}
+            )
+            
+            if not created:
+                wishlist_item.notes = notes
+                wishlist_item.save()
+            
+            return JsonResponse({
+                'status': 'success',
+                'message': f'{product.name} added to wishlist'
+            }, status=201)
+        except Product.DoesNotExist:
+            return JsonResponse({'error': 'Product not found'}, status=404)
+        except Exception as e:
+            logger.error(f"Wishlist error: {str(e)}")
+            return JsonResponse({'error': 'Failed to add to wishlist'}, status=500)
+    
+    @login_required
+    def get(self, request):
+        wishlist_items = Wishlist.objects.filter(
+            user=request.user
+        ).select_related('product', 'product__farmer')
+        
+        items_data = [{
+            'id': item.id,
+            'product_id': item.product.id,
+            'name': item.product.name,
+            'price': str(item.product.price),
+            'unit': item.product.unit,
+            'farmer_name': item.product.farmer.farm_name,
+            'farmer_rating': str(item.product.farmer.rating or 0.0),
+            'is_organic': item.product.is_organic,
+            'image_url': item.product.image.url if item.product.image else None,
+            'added_at': item.added_at.isoformat(),
+            'notes': item.notes
+        } for item in wishlist_items]
+        
+        return JsonResponse({'items': items_data})
+    
+    @login_required
+    def delete(self, request, product_id):
+        try:
+            Wishlist.objects.filter(
+                user=request.user,
+                product_id=product_id
+            ).delete()
+            return JsonResponse({
+                'status': 'success',
+                'message': 'Item removed from wishlist'
+            })
+        except Exception as e:
+            logger.error(f"Wishlist delete error: {str(e)}")
+            return JsonResponse({'error': 'Failed to remove from wishlist'}, status=500)
+
+class AnalyticsAPI(APIView):
+    @login_required
+    def get(self, request):
+        try:
+            dashboard_data = AnalyticsService.get_farmer_dashboard_data(request.user)
+            return JsonResponse(dashboard_data)
+        except Exception as e:
+            logger.error(f"Analytics error: {str(e)}")
+            return JsonResponse({'error': 'Failed to retrieve analytics'}, status=500)
+
+class SearchAPI(APIView):
+    def get(self, request):
+        try:
+            query = request.GET.get('q', '')
+            category = request.GET.get('category')
+            min_price = request.GET.get('min_price')
+            max_price = request.GET.get('max_price')
+            is_organic = request.GET.get('organic')
+            sort_by = request.GET.get('sort', 'relevance')
+            farmer_rating = request.GET.get('farmer_rating')
+            certifications = request.GET.get('certifications')
+            page = int(request.GET.get('page', 1))
+            page_size = min(int(request.GET.get('page_size', 12)), 50)
+            
+            if not query:
+                return JsonResponse({'products': [], 'total_pages': 0})
+            
+            # Parse certifications
+            cert_list = certifications.split(',') if certifications else None
+            
+            # Perform search
+            queryset = SearchService.advanced_search(
+                query, category, min_price, max_price, 
+                is_organic == 'true' if is_organic else None,
+                sort_by, farmer_rating, cert_list
+            )
+            
+            # Paginate results
+            paginator = Paginator(queryset, page_size)
+            try:
+                page_obj = paginator.page(page)
+            except EmptyPage:
+                page_obj = paginator.page(paginator.num_pages)
+            
+            products_data = [{
+                'id': product.id,
+                'name': product.name,
+                'price': str(product.price),
+                'unit': product.unit,
+                'quantity': product.quantity,
+                'farmer_name': product.farmer.farm_name,
+                'farmer_rating': str(product.farmer.rating or 0.0),
+                'farmer_total_reviews': product.farmer.total_reviews,
+                'is_organic': product.is_organic,
+                'image_url': product.image.url if product.image else None,
+                'created_at': product.created_at.isoformat(),
+                'grade': product.grade,
+                'variety': product.variety,
+                'certifications': [c.name for c in product.certifications.all()],
+                'sustainability_score': str(product.sustainability_score) if product.sustainability_score else None
+            } for product in page_obj]
+            
+            return JsonResponse({
+                'products': products_data,
+                'current_page': page,
+                'total_pages': paginator.num_pages,
+                'total_results': paginator.count,
+                'query': query
+            })
+        except Exception as e:
+            logger.error(f"Search error: {str(e)}")
+            return JsonResponse({'error': 'Search failed'}, status=500)
+
+class FarmerProfileAPI(APIView):
+    @login_required
+    def get(self, request, farmer_id=None):
+        try:
+            if farmer_id:
+                farmer = Farmer.objects.get(id=farmer_id)
+            else:
+                farmer = request.user
+            
+            # Get farmer products
+            products = Product.objects.filter(
+                farmer=farmer,
+                is_available=True
+            ).order_by('-created_at')[:10]
+            
+            # Get farmer reviews
+            reviews = Review.objects.filter(
+                order__farmer=farmer
+            ).select_related('order__buyer').order_by('-created_at')[:5]
+            
+            profile_data = {
+                'id': farmer.id,
+                'farm_name': farmer.farm_name,
+                'bio': farmer.bio,
+                'rating': str(farmer.rating or 0.0),
+                'total_reviews': farmer.total_reviews,
+                'country': farmer.country.name,
+                'region': farmer.region,
+                'years_experience': farmer.years_experience,
+                'farm_size_acres': str(farmer.farm_size_acres) if farmer.farm_size_acres else None,
+                'specialties': [s.name for s in farmer.specialties.all()],
+                'certifications': [
+                    {
+                        'name': fc.certification.name,
+                        'certificate_number': fc.certificate_number,
+                        'expiry_date': fc.expiry_date.isoformat() if fc.expiry_date else None
+                    }
+                    for fc in FarmerCertification.objects.filter(
+                        farmer=farmer,
+                        is_verified=True
+                    ).select_related('certification')
+                ],
+                'profile_image': farmer.profile_image.url if farmer.profile_image else None,
+                'cover_image': farmer.cover_image.url if farmer.cover_image else None,
+                'website': farmer.website,
+                'social_media': farmer.social_media,
+                'is_verified': farmer.verification_status == 'verified',
+                'is_premium': farmer.is_premium,
+                'products': [{
+                    'id': p.id,
+                    'name': p.name,
+                    'price': str(p.price),
+                    'unit': p.unit,
+                    'quantity': p.quantity,
+                    'image_url': p.image.url if p.image else None,
+                    'is_organic': p.is_organic,
+                    'grade': p.grade,
+                    'created_at': p.created_at.isoformat()
+                } for p in products],
+                'recent_reviews': [{
+                    'rating': r.rating,
+                    'title': r.title,
+                    'comment': r.comment,
+                    'reviewer': r.order.buyer.farm_name,
+                    'created_at': r.created_at.isoformat()
+                } for r in reviews]
+            }
+            
+            return JsonResponse(profile_data)
+        except Farmer.DoesNotExist:
+            return JsonResponse({'error': 'Farmer not found'}, status=404)
+        except Exception as e:
+            logger.error(f"Farmer profile error: {str(e)}")
+            return JsonResponse({'error': 'Failed to retrieve profile'}, status=500)
+    
+    @login_required
+    def put(self, request):
+        try:
+            data = json.loads(request.body)
+            
+            # Update basic info
+            request.user.bio = DataValidator.sanitize_input(data.get('bio', request.user.bio))
+            request.user.region = DataValidator.sanitize_input(data.get('region', request.user.region))
+            request.user.phone_number = DataValidator.sanitize_input(data.get('phone_number', request.user.phone_number))
+            request.user.website = DataValidator.sanitize_input(data.get('website', request.user.website))
+            
+            # Update social media
+            social_media = data.get('social_media', {})
+            if isinstance(social_media, dict):
+                request.user.social_media = social_media
+            
+            # Update specialties
+            specialties = data.get('specialties', [])
+            if specialties:
+                categories = ProductCategory.objects.filter(code__in=specialties)
+                request.user.specialties.set(categories)
+            
+            request.user.save()
+            
+            return JsonResponse({
+                'status': 'success',
+                'message': 'Profile updated successfully'
+            })
+        except Exception as e:
+            logger.error(f"Profile update error: {str(e)}")
+            return JsonResponse({'error': 'Failed to update profile'}, status=500)
+
+class ProductAPI(APIView):
+    @login_required
+    def post(self, request):
+        try:
+            data = json.loads(request.body)
+            
+            # Validate required fields
+            required_fields = ['name', 'price', 'unit', 'quantity', 'category', 'harvest_date']
+            for field in required_fields:
+                if not data.get(field):
+                    return JsonResponse({'error': f'{field} is required'}, status=400)
+            
+            # Create product
+            product = Product.objects.create(
+                name=DataValidator.sanitize_input(data['name']),
+                description=DataValidator.sanitize_input(data.get('description', '')),
+                price=Decimal(str(data['price'])),
+                unit=data['unit'],
+                quantity=int(data['quantity']),
+                category_id=data['category'],
+                farmer=request.user,
+                harvest_date=datetime.strptime(data['harvest_date'], '%Y-%m-%d').date(),
+                is_organic=bool(data.get('is_organic', False)),
+                grade=data.get('grade', 'standard'),
+                variety=DataValidator.sanitize_input(data.get('variety', '')),
+                origin_region=DataValidator.sanitize_input(data.get('origin_region', '')),
+                storage_requirements=DataValidator.sanitize_input(data.get('storage_requirements', '')),
+                shelf_life_days=data.get('shelf_life_days'),
+                weight_kg=Decimal(str(data.get('weight_kg', '0'))) if data.get('weight_kg') else None,
+                dimensions_cm=DataValidator.sanitize_input(data.get('dimensions_cm', '')),
+                packaging_type=DataValidator.sanitize_input(data.get('packaging_type', '')),
+                sustainability_score=Decimal(str(data.get('sustainability_score', '0'))) if data.get('sustainability_score') else None,
+                minimum_order_quantity=int(data.get('minimum_order_quantity', 1)),
+                seo_keywords=DataValidator.sanitize_input(data.get('seo_keywords', '')),
+                tags=data.get('tags', []),
+                is_available=bool(data.get('is_available', True))
+            )
+            
+            # Handle certifications
+            certifications = data.get('certifications', [])
+            if certifications:
+                cert_objects = CertificationType.objects.filter(id__in=certifications)
+                product.certifications.set(cert_objects)
+            
+            # Handle bulk pricing
+            bulk_pricing = data.get('bulk_pricing', {})
+            if isinstance(bulk_pricing, dict):
+                product.bulk_pricing = bulk_pricing
+                product.save()
+            
+            return JsonResponse({
+                'status': 'success',
+                'message': 'Product created successfully',
+                'product_id': product.id
+            }, status=201)
+        except Exception as e:
+            logger.error(f"Product creation error: {str(e)}")
+            return JsonResponse({'error': 'Failed to create product'}, status=500)
+    
+    def get(self, request, product_id=None):
+        try:
+            if product_id:
+                product = Product.objects.select_related(
+                    'farmer', 'category'
+                ).prefetch_related(
+                    'certifications', 'reviews'
+                ).get(id=product_id)
+                
+                # Increment view count
+                product.views = F('views') + 1
+                product.save()
+                
+                # Get related products
+                related_products = Product.objects.filter(
+                    category=product.category,
+                    is_available=True
+                ).exclude(id=product.id)[:5]
+                
+                # Get reviews
+                reviews = product.reviews.select_related('reviewer').order_by('-created_at')[:10]
+                
+                product_data = {
+                    'id': product.id,
+                    'name': product.name,
+                    'description': product.description,
+                    'price': str(product.price),
+                    'unit': product.unit,
+                    'quantity': product.quantity,
+                    'harvest_date': product.harvest_date.isoformat(),
+                    'is_organic': product.is_organic,
+                    'grade': product.grade,
+                    'variety': product.variety,
+                    'origin_region': product.origin_region,
+                    'storage_requirements': product.storage_requirements,
+                    'shelf_life_days': product.shelf_life_days,
+                    'weight_kg': str(product.weight_kg) if product.weight_kg else None,
+                    'dimensions_cm': product.dimensions_cm,
+                    'packaging_type': product.packaging_type,
+                    'sustainability_score': str(product.sustainability_score) if product.sustainability_score else None,
+                    'minimum_order_quantity': product.minimum_order_quantity,
+                    'bulk_pricing': product.bulk_pricing,
+                    'tags': product.tags,
+                    'is_available': product.is_available,
+                    'views': product.views,
+                    'likes': product.likes,
+                    'created_at': product.created_at.isoformat(),
+                    'updated_at': product.updated_at.isoformat(),
+                    'image_url': product.image.url if product.image else None,
+                    'gallery_images': product.gallery_images,
+                    'farmer': {
+                        'id': product.farmer.id,
+                        'farm_name': product.farmer.farm_name,
+                        'rating': str(product.farmer.rating or 0.0),
+                        'total_reviews': product.farmer.total_reviews,
+                        'country': product.farmer.country.name,
+                        'region': product.farmer.region,
+                        'is_verified': product.farmer.verification_status == 'verified',
+                        'profile_image': product.farmer.profile_image.url if product.farmer.profile_image else None
+                    },
+                    'category': {
+                        'id': product.category.id,
+                        'name': product.category.name,
+                        'code': product.category.code
+                    },
+                    'certifications': [
+                        {
+                            'name': c.name,
+                            'description': c.description,
+                            'icon': c.icon
+                        }
+                        for c in product.certifications.all()
+                    ],
+                    'nutritional_info': product.nutritional_info,
+                    'related_products': [{
+                        'id': rp.id,
+                        'name': rp.name,
+                        'price': str(rp.price),
+                        'unit': rp.unit,
+                        'image_url': rp.image.url if rp.image else None
+                    } for rp in related_products],
+                    'reviews': [{
+                        'id': r.id,
+                        'rating': r.rating,
+                        'title': r.title,
+                        'comment': r.comment,
+                        'reviewer': r.reviewer.farm_name,
+                        'reviewer_image': r.reviewer.profile_image.url if r.reviewer.profile_image else None,
+                        'created_at': r.created_at.isoformat(),
+                        'helpful_count': r.helpful_count,
+                        'images': r.images,
+                        'pros': r.pros,
+                        'cons': r.cons
+                    } for r in reviews],
+                    'average_rating': product.reviews.aggregate(avg=Avg('rating'))['avg'] or 0.0,
+                    'total_reviews': product.reviews.count()
+                }
+                
+                return JsonResponse(product_data)
+            else:
+                # List products
+                page = int(request.GET.get('page', 1))
+                page_size = min(int(request.GET.get('page_size', 12)), 50)
+                category = request.GET.get('category')
+                farmer_id = request.GET.get('farmer')
+                
+                products = Product.objects.filter(is_available=True)
+                if category:
+                    products = products.filter(category__code=category)
+                if farmer_id:
+                    products = products.filter(farmer_id=farmer_id)
+                
+                products = products.select_related('farmer', 'category').order_by('-created_at')
+                paginator = Paginator(products, page_size)
+                
+                try:
+                    page_obj = paginator.page(page)
+                except EmptyPage:
+                    page_obj = paginator.page(paginator.num_pages)
+                
+                products_data = [{
+                    'id': p.id,
+                    'name': p.name,
+                    'price': str(p.price),
+                    'unit': p.unit,
+                    'quantity': p.quantity,
+                    'farmer_name': p.farmer.farm_name,
+                    'farmer_rating': str(p.farmer.rating or 0.0),
+                    'is_organic': p.is_organic,
+                    'grade': p.grade,
+                    'image_url': p.image.url if p.image else None,
+                    'created_at': p.created_at.isoformat()
+                } for p in page_obj]
+                
+                return JsonResponse({
+                    'products': products_data,
+                    'current_page': page,
+                    'total_pages': paginator.num_pages,
+                    'total_products': paginator.count
+                })
+        except Product.DoesNotExist:
+            return JsonResponse({'error': 'Product not found'}, status=404)
+        except Exception as e:
+            logger.error(f"Product API error: {str(e)}")
+            return JsonResponse({'error': 'Failed to retrieve product'}, status=500)
+
+# ======================
+# COMPREHENSIVE SYSTEM INITIALIZATION
+# ======================
+def initialize_system():
+    # CARICOM Countries with additional data
+    countries = [
+        {'code': 'TT', 'name': 'Trinidad and Tobago', 'currency_code': 'TTD', 'tax_rate': 12.5, 'phone_code': '+1868', 'timezone': 'America/Port_of_Spain', 'capital_city': 'Port of Spain', 'official_language': 'English', 'flag_url': 'https://upload.wikimedia.org/wikipedia/commons/6/64/Flag_of_Trinidad_and_Tobago.svg'},
+        {'code': 'JM', 'name': 'Jamaica', 'currency_code': 'JMD', 'tax_rate': 15.0, 'phone_code': '+1876', 'timezone': 'America/Jamaica', 'capital_city': 'Kingston', 'official_language': 'English', 'flag_url': 'https://upload.wikimedia.org/wikipedia/commons/0/0a/Flag_of_Jamaica.svg'},
+        {'code': 'BB', 'name': 'Barbados', 'currency_code': 'BBD', 'tax_rate': 17.5, 'phone_code': '+1246', 'timezone': 'America/Barbados', 'capital_city': 'Bridgetown', 'official_language': 'English', 'flag_url': 'https://upload.wikimedia.org/wikipedia/commons/e/ef/Flag_of_Barbados.svg'},
+        {'code': 'GY', 'name': 'Guyana', 'currency_code': 'GYD', 'tax_rate': 16.0, 'phone_code': '+592', 'timezone': 'America/Guyana', 'capital_city': 'Georgetown', 'official_language': 'English', 'flag_url': 'https://upload.wikimedia.org/wikipedia/commons/9/99/Flag_of_Guyana.svg'},
+        {'code': 'SR', 'name': 'Suriname', 'currency_code': 'SRD', 'tax_rate': 10.0, 'phone_code': '+597', 'timezone': 'America/Paramaribo', 'capital_city': 'Paramaribo', 'official_language': 'Dutch', 'flag_url': 'https://upload.wikimedia.org/wikipedia/commons/6/60/Flag_of_Suriname.svg'},
+        {'code': 'LC', 'name': 'Saint Lucia', 'currency_code': 'XCD', 'tax_rate': 15.0, 'phone_code': '+1758', 'timezone': 'America/St_Lucia', 'capital_city': 'Castries', 'official_language': 'English', 'flag_url': 'https://upload.wikimedia.org/wikipedia/commons/9/9f/Flag_of_Saint_Lucia.svg'},
+        {'code': 'VC', 'name': 'Saint Vincent and the Grenadines', 'currency_code': 'XCD', 'tax_rate': 15.0, 'phone_code': '+1784', 'timezone': 'America/St_Vincent', 'capital_city': 'Kingstown', 'official_language': 'English', 'flag_url': 'https://upload.wikimedia.org/wikipedia/commons/6/6d/Flag_of_Saint_Vincent_and_the_Grenadines.svg'},
+        {'code': 'GD', 'name': 'Grenada', 'currency_code': 'XCD', 'tax_rate': 15.0, 'phone_code': '+1473', 'timezone': 'America/Grenada', 'capital_city': 'St. George\'s', 'official_language': 'English', 'flag_url': 'https://upload.wikimedia.org/wikipedia/commons/b/bc/Flag_of_Grenada.svg'},
+        {'code': 'AG', 'name': 'Antigua and Barbuda', 'currency_code': 'XCD', 'tax_rate': 15.0, 'phone_code': '+1268', 'timezone': 'America/Antigua', 'capital_city': 'St. John\'s', 'official_language': 'English', 'flag_url': 'https://upload.wikimedia.org/wikipedia/commons/8/89/Flag_of_Antigua_and_Barbuda.svg'},
+        {'code': 'DM', 'name': 'Dominica', 'currency_code': 'XCD', 'tax_rate': 15.0, 'phone_code': '+1767', 'timezone': 'America/Dominica', 'capital_city': 'Roseau', 'official_language': 'English', 'flag_url': 'https://upload.wikimedia.org/wikipedia/commons/c/c4/Flag_of_Dominica.svg'},
+        {'code': 'KN', 'name': 'Saint Kitts and Nevis', 'currency_code': 'XCD', 'tax_rate': 15.0, 'phone_code': '+1869', 'timezone': 'America/St_Kitts', 'capital_city': 'Basseterre', 'official_language': 'English', 'flag_url': 'https://upload.wikimedia.org/wikipedia/commons/f/fe/Flag_of_Saint_Kitts_and_Nevis.svg'},
+        {'code': 'BS', 'name': 'Bahamas', 'currency_code': 'BSD', 'tax_rate': 12.0, 'phone_code': '+1242', 'timezone': 'America/Nassau', 'capital_city': 'Nassau', 'official_language': 'English', 'flag_url': 'https://upload.wikimedia.org/wikipedia/commons/9/93/Flag_of_the_Bahamas.svg'},
+        {'code': 'BZ', 'name': 'Belize', 'currency_code': 'BZD', 'tax_rate': 12.5, 'phone_code': '+501', 'timezone': 'America/Belize', 'capital_city': 'Belmopan', 'official_language': 'English', 'flag_url': 'https://upload.wikimedia.org/wikipedia/commons/e/e7/Flag_of_Belize.svg'},
+        {'code': 'HT', 'name': 'Haiti', 'currency_code': 'HTG', 'tax_rate': 10.0, 'phone_code': '+509', 'timezone': 'America/Port-au-Prince', 'capital_city': 'Port-au-Prince', 'official_language': 'French, Haitian Creole', 'flag_url': 'https://upload.wikimedia.org/wikipedia/commons/5/56/Flag_of_Haiti.svg'},
+        {'code': 'DO', 'name': 'Dominican Republic', 'currency_code': 'DOP', 'tax_rate': 18.0, 'phone_code': '+1809', 'timezone': 'America/Santo_Domingo', 'capital_city': 'Santo Domingo', 'official_language': 'Spanish', 'flag_url': 'https://upload.wikimedia.org/wikipedia/commons/9/9f/Flag_of_the_Dominican_Republic.svg'},
+    ]
+    
+    for country in countries:
+        CARICOMCountry.objects.update_or_create(
+            code=country['code'],
+            defaults={
+                'name': country['name'],
+                'currency_code': country['currency_code'],
+                'tax_rate': country['tax_rate'],
+                'phone_code': country['phone_code'],
+                'timezone': country['timezone'],
+                'capital_city': country['capital_city'],
+                'official_language': country['official_language'],
+                'flag_url': country['flag_url']
+            }
+        )
+    
+    # Product Categories with icons
+    categories = [
+        {'code': 'FRT', 'name': 'Fruits', 'export_restricted': False, 'icon': '🍎', 'description': 'Fresh fruits from local farms'},
+        {'code': 'VEG', 'name': 'Vegetables', 'export_restricted': False, 'icon': '🥕', 'description': 'Organic and conventional vegetables'},
+        {'code': 'GRA', 'name': 'Grains', 'export_restricted': False, 'icon': '🌾', 'description': 'Cereals and grain products'},
+        {'code': 'LIV', 'name': 'Livestock', 'export_restricted': True, 'icon': '🐄', 'description': 'Live animals and meat products'},
+        {'code': 'DAI', 'name': 'Dairy', 'export_restricted': False, 'icon': '🥛', 'description': 'Milk, cheese, and dairy products'},
+        {'code': 'SPC', 'name': 'Spices', 'export_restricted': False, 'icon': '🌶️', 'description': 'Herbs and spices'},
+        {'code': 'NUT', 'name': 'Nuts', 'export_restricted': False, 'icon': '🥜', 'description': 'Tree nuts and seeds'},
+        {'code': 'SEA', 'name': 'Seafood', 'export_restricted': False, 'icon': '🐟', 'description': 'Fresh fish and seafood'},
+        {'code': 'BVG', 'name': 'Beverages', 'export_restricted': False, 'icon': '☕', 'description': 'Juices, teas, and other beverages'},
+        {'code': 'PRO', 'name': 'Processed Foods', 'export_restricted': False, 'icon': '🥫', 'description': 'Value-added agricultural products'},
+    ]
+    
+    for category in categories:
+        ProductCategory.objects.update_or_create(
+            code=category['code'],
+            defaults={
+                'name': category['name'],
+                'export_restricted': category['export_restricted'],
+                'icon': category['icon'],
+                'description': category['description']
+            }
+        )
+    
+    # Certification Types
+    certifications = [
+        {'name': 'Organic Certification', 'description': 'Certified organic by recognized authorities', 'issuing_organization': 'CARICOM Organic Standards', 'is_international': True, 'validity_period_years': 3},
+        {'name': 'Fair Trade', 'description': 'Fair trade certified products', 'issuing_organization': 'Fair Trade Organization', 'is_international': True, 'validity_period_years': 2},
+        {'name': 'GAP (Good Agricultural Practices)', 'description': 'Good Agricultural Practices certification', 'issuing_organization': 'Ministry of Agriculture', 'is_international': False, 'validity_period_years': 1},
+        {'name': 'Kosher', 'description': 'Kosher certified products', 'issuing_organization': 'Religious Authority', 'is_international': True, 'validity_period_years': 1},
+        {'name': 'Halal', 'description': 'Halal certified products', 'issuing_organization': 'Religious Authority', 'is_international': True, 'validity_period_years': 1},
+    ]
+    
+    for cert in certifications:
+        CertificationType.objects.update_or_create(
+            name=cert['name'],
+            defaults={
+                'description': cert['description'],
+                'issuing_organization': cert['issuing_organization'],
+                'is_international': cert['is_international'],
+                'validity_period_years': cert['validity_period_years']
+            }
+        )
+    
+    # Shipping Methods
+    shipping_methods = [
+        {'name': 'Standard Delivery', 'base_cost': 50.00, 'cost_per_km': 1.20, 'estimated_delivery_days': 3, 'is_active': True},
+        {'name': 'Express Delivery', 'base_cost': 100.00, 'cost_per_km': 2.00, 'estimated_delivery_days': 1, 'is_active': True},
+        {'name': 'Economy Delivery', 'base_cost': 30.00, 'cost_per_km': 0.80, 'estimated_delivery_days': 5, 'is_active': True},
+    ]
+    
+    for method in shipping_methods:
+        ShippingMethod.objects.update_or_create(
+            name=method['name'],
+            defaults={
+                'base_cost': method['base_cost'],
+                'cost_per_km': method['cost_per_km'],
+                'estimated_delivery_days': method['estimated_delivery_days'],
+                'is_active': method['is_active']
+            }
+        )
+    
+    # Subscription Plans
+    plans = [
+        {
+            'name': 'Starter',
+            'description': 'Perfect for small farms getting started',
+            'price': 29.99,
+            'features': {
+                'max_products': 50,
+                'max_orders': 200,
+                'support': 'basic',
+                'analytics': 'basic'
+            },
+            'max_products': 50,
+            'max_orders': 200,
+            'support_level': 'basic'
+        },
+        {
+            'name': 'Professional',
+            'description': 'For growing farms with expanding operations',
+            'price': 79.99,
+            'features': {
+                'max_products': 200,
+                'max_orders': 1000,
+                'support': 'priority',
+                'analytics': 'advanced',
+                'marketing_tools': True
+            },
+            'max_products': 200,
+            'max_orders': 1000,
+            'support_level': 'priority'
+        },
+        {
+            'name': 'Enterprise',
+            'description': 'For large operations with complex needs',
+            'price': 199.99,
+            'features': {
+                'max_products': 1000,
+                'max_orders': 10000,
+                'support': 'premium',
+                'analytics': 'enterprise',
+                'marketing_tools': True,
+                'dedicated_account_manager': True
+            },
+            'max_products': 1000,
+            'max_orders': 10000,
+            'support_level': 'premium'
+        }
+    ]
+    
+    for plan in plans:
+        SubscriptionPlan.objects.update_or_create(
+            name=plan['name'],
+            defaults={
+                'description': plan['description'],
+                'price': plan['price'],
+                'features': plan['features'],
+                'max_products': plan['max_products'],
+                'max_orders': plan['max_orders'],
+                'support_level': plan['support_level'],
+                'is_active': True
+            }
+        )
+
+# ======================
+# URL CONFIGURATION
+# ======================
+urlpatterns = [
+    path('api/cart/', EnhancedCartAPI.as_view()),
+    path('api/cart/<int:item_id>/', EnhancedCartAPI.as_view()),
+    path('api/orders/', EnhancedOrderAPI.as_view()),
+    path('api/orders/<int:order_id>/', EnhancedOrderAPI.as_view()),
+    path('api/reviews/<int:order_id>/', EnhancedReviewAPI.as_view()),
+    path('api/wishlist/', WishlistAPI.as_view()),
+    path('api/wishlist/<int:product_id>/', WishlistAPI.as_view()),
+    path('api/analytics/', AnalyticsAPI.as_view()),
+    path('api/search/', SearchAPI.as_view()),
+    path('api/farmer/profile/', FarmerProfileAPI.as_view()),
+    path('api/farmer/profile/<int:farmer_id>/', FarmerProfileAPI.as_view()),
+    path('api/products/', ProductAPI.as_view()),
+    path('api/products/<int:product_id>/', ProductAPI.as_view()),
+]
+
+# ======================
+# SETTINGS CONFIGURATION
+# ======================
+if __name__ == "__main__":
+    settings.configure(
+        DEBUG=True,
+        SECRET_KEY='your-secret-key-here',
+        DATABASES={
+            'default': {
+                'ENGINE': 'django.db.backends.sqlite3',
+                'NAME': 'farmlink.db',
+            }
+        },
+        INSTALLED_APPS=[
+            'django.contrib.auth',
+            'django.contrib.contenttypes',
+            'django.contrib.sessions',
+            'django.contrib.messages',
+            'rest_framework',
+        ],
+        MIDDLEWARE=[
+            'django.middleware.security.SecurityMiddleware',
+            'django.contrib.sessions.middleware.SessionMiddleware',
+            'django.middleware.common.CommonMiddleware',
+            'django.middleware.csrf.CsrfViewMiddleware',
+            'django.contrib.auth.middleware.AuthenticationMiddleware',
+            'django.contrib.messages.middleware.MessageMiddleware',
+        ],
+        ROOT_URLCONF='__main__',
+        USE_TZ=True,
+        TIME_ZONE='UTC',
+        STRIPE_SECRET_KEY='sk_test_your_stripe_key',
+        DEFAULT_FROM_EMAIL='noreply@farmlink.com',
+        EMAIL_BACKEND='django.core.mail.backends.console.EmailBackend',
+        USE_POSTGRES=False,
+    )
+    
+    # Initialize database and system
+    from django.core.management import execute_from_command_line
+    import django
+    django.setup()
+    
+    # Create tables
+    from django.core.management import call_command
+    call_command('migrate', verbosity=0, interactive=False)
+    
+    # Initialize system data
+    initialize_system()
+    
+    print("FarmLink Agricultural Marketplace initialized successfully!")
+    print("Features include:")
+    print("- Comprehensive farmer profiles with certifications")
+    print("- Advanced product management with detailed specifications")
+    print("- Shopping cart with wishlist functionality")
+    print("- Order management with multiple statuses")
+    print("- Review system with detailed feedback")
+    print("- Analytics dashboard for farmers")
+    print("- Advanced search with multiple filters")
+    print("- Subscription plans for different business sizes")
+    print("- Multi-country support with regional tax rates")
+    print("- Certification tracking and verification")
+    print("- Bulk pricing and discount codes")
+    print("- Messaging system between farmers and buyers")
+    print("- Support ticket system")
+    print("- Blog and FAQ sections")
+    print("- SEO optimization features")
+    print("- Image optimization and gallery support")
+    print("- Sustainability scoring for products")
